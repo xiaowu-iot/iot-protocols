@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.xiaowuiot</groupId>
+        <artifactId>iot-protocols</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>protocol-jt1078</artifactId>
+    <name>protocol-jt1078</name>
+    <description>JT/T 1078 道路运输车辆视频通信：信令、码流解包与帧重组、HTTP-FLV 转封装</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.github.xiaowuiot</groupId>
+            <artifactId>protocol-jt808</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-codec-http</artifactId>
+        </dependency>
+    </dependencies>
+</project>
