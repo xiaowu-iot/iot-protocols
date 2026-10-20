@@ -62,6 +62,38 @@ class Jt808ServerHandlerTest {
     }
 
     @Test
+    void connectionEvents() {
+        List<String> events = new ArrayList<>();
+        sessions.addListener(new io.github.xiaowuiot.protocol.codec.session.SessionListener() {
+            @Override
+            public void onConnect(String protocol, io.netty.channel.Channel channel) {
+                events.add("connect");
+            }
+
+            @Override
+            public void onAuth(String protocol, io.netty.channel.Channel channel, String deviceId, String action, boolean success, String detail) {
+                events.add(action + ":" + success + (detail == null ? "" : ":" + detail));
+            }
+
+            @Override
+            public void onDisconnect(String protocol, io.netty.channel.Channel channel, String deviceId, String reason) {
+                events.add("disconnect:" + deviceId + ":" + reason);
+            }
+        });
+        ch = channel(new Jt808ServerHandler(sessions, new InMemoryAuthService(), sender,
+                (session, msg) -> CompletableFuture.completedFuture(null)));
+
+        RegisterResponse rr = send(MessageId.REGISTER, new Register().setProvince(44).setCity(300).setMakerId("TEST1")
+                .setModel("M1").setTerminalId("T000001").setPlateColor(2).setPlate("粤B12345")).getBody();
+        send(MessageId.AUTH, new Auth("wrong"));
+        send(MessageId.AUTH, new Auth(rr.getAuthCode()));
+        ch.close();
+
+        assertEquals(java.util.Arrays.asList("connect", "注册:true", "鉴权:false:鉴权码不正确", "鉴权:true",
+                "disconnect:13800138000:连接断开"), events);
+    }
+
+    @Test
     void registerAuthHeartbeatLocation() {
         RegisterResponse rr = send(MessageId.REGISTER, new Register().setProvince(44).setCity(300).setMakerId("TEST1")
                 .setModel("M1").setTerminalId("T000001").setPlateColor(2).setPlate("粤B12345")).getBody();
