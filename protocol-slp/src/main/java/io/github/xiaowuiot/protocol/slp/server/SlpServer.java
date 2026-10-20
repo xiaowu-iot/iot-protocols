@@ -36,10 +36,12 @@ public class SlpServer {
 
     private final SessionManager sessions;
     private final PendingRequests<SlpMessage> pending = new PendingRequests<>();
+    private final ChunkProvider chunks;
     private final TcpServer server;
 
     private SlpServer(Builder b) {
         this.sessions = b.sessions != null ? b.sessions : new SessionManager();
+        this.chunks = b.chunks != null ? b.chunks : ChunkProvider.NONE;
         Handler handler = new Handler(b.registered, b.heartbeatSeconds, b.listener);
         this.server = new TcpServer("SLP 接入服务", PROTOCOL, b.port, b.heartbeatSeconds * 3, b.workerThreads,
                 pipeline -> {
@@ -100,13 +102,23 @@ public class SlpServer {
     }
 
     /**
-     * 业务消息：格口状态等。
-     * 在 future 完成后才回应答。
+     * 业务消息：格口状态、升级进度（分片请求）、升级结果。
+     * 格口状态和升级结果在 future 完成后才回应答。
      */
     public interface Listener {
         Listener NOOP = (session, msg) -> CompletableFuture.completedFuture(null);
 
         CompletionStage<Void> onMessage(Session session, SlpMessage msg);
+    }
+
+    /**
+     * 升级分片从哪里取。设备要哪一片就给哪一片，断点续传的状态在设备上，平台不用记。
+     * 默认没有固件，统一回"版本不存在"；接入固件仓库时实现这个接口，通过 {@link Builder#chunks} 传进来
+     */
+    public interface ChunkProvider {
+        ChunkProvider NONE = req -> new SlpBodies.OtaChunk(SlpBodies.OtaChunk.VERSION_NOT_FOUND, req.getOffset(), new byte[0]);
+
+        SlpBodies.OtaChunk chunk(SlpBodies.OtaChunkRequest req);
     }
 
     @ChannelHandler.Sharable
@@ -144,9 +156,9 @@ public class SlpServer {
                     ctx.writeAndFlush(msg.response(null));
                     break;
                 case SlpMessage.OTA_CHUNK_REQUEST:
-                    // 开源版不带固件分发，统一回"版本不存在"
-                    ctx.writeAndFlush(msg.response(new SlpBodies.OtaChunk(SlpBodies.OtaChunk.VERSION_NOT_FOUND,
-                            msg.<SlpBodies.OtaChunkRequest>getBody().getOffset(), new byte[0])));
+                    ctx.writeAndFlush(msg.response(chunks.chunk(msg.<SlpBodies.OtaChunkRequest>getBody())));
+                    // 分片请求同时也是升级进度，交给业务记录，不用等它
+                    listener.onMessage(session, msg);
                     break;
                 default:
                     listener.onMessage(session, msg).whenComplete((v, e) -> {
@@ -215,6 +227,7 @@ public class SlpServer {
         private int heartbeatSeconds = 60;
         private int workerThreads = 0;
         private SessionManager sessions;
+        private ChunkProvider chunks;
         private LongPredicate registered = id -> true;
         private Listener listener = Listener.NOOP;
 
@@ -238,6 +251,14 @@ public class SlpServer {
 
         public Builder sessions(SessionManager sessions) {
             this.sessions = sessions;
+            return this;
+        }
+
+        /**
+         * 升级分片的来源，不设置时没有固件可升级
+         */
+        public Builder chunks(ChunkProvider chunks) {
+            this.chunks = chunks;
             return this;
         }
 
