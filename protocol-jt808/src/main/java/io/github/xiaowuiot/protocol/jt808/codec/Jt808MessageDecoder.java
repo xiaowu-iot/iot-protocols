@@ -87,11 +87,22 @@ public class Jt808MessageDecoder extends MessageToMessageDecoder<ByteBuf> {
             drop(ctx, frame.readerIndex(start), "消息体长度不符，属性里是 " + header.getBodyLength() + "，实际 " + bodyLength);
             return;
         }
-        if (header.getEncryption() != 0) {
-            drop(ctx, frame.readerIndex(start), "不支持加密的消息");
-            return;
-        }
         ByteBuf body = frame.slice(frame.readerIndex(), bodyLength);
+        if (header.getEncryption() != 0) {
+            Jt808Rsa rsa = ctx.channel().attr(Jt808Rsa.KEY).get();
+            if ((header.getEncryption() & Jt808Rsa.RSA) == 0 || rsa == null) {
+                drop(ctx, frame.readerIndex(start), rsa == null ? "收到加密的消息，但没有配置平台 RSA 密钥" : "不支持的加密方式 " + header.getEncryption());
+                return;
+            }
+            try {
+                byte[] plain = rsa.decrypt(ByteBufUtil.getBytes(body));
+                body = io.netty.buffer.Unpooled.wrappedBuffer(plain);
+                header.setBodyLength(plain.length);
+            } catch (IllegalArgumentException e) {
+                drop(ctx, frame.readerIndex(start), e.getMessage());
+                return;
+            }
+        }
 
         if (header.isSubpackage()) {
             if (ctx.channel().parent() != null && ctx.channel().attr(Session.KEY).get() == null) {

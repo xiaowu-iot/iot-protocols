@@ -42,6 +42,7 @@ public class TcpServer {
     private final Runnable beforeStop;
     private final IoStats ioStats = new IoStats();
     private final RawMessageRecorder rawRecorder;
+    private volatile ConnectionLimiter limiter;
 
     private EventLoopGroup boss;
     private EventLoopGroup worker;
@@ -71,6 +72,10 @@ public class TcpServer {
      * 给一条连接装配流水线。单元测试里用它装到 EmbeddedChannel 上，不需要真的监听端口
      */
     public void initPipeline(ChannelPipeline pipeline) {
+        ConnectionLimiter l = limiter;
+        if (l != null) {
+            pipeline.addLast("limiter", l);
+        }
         pipeline.addLast("idle", new IdleStateHandler(idleSeconds, 0, 0, TimeUnit.SECONDS))
                 // 统计和原始报文记录放在最前面，看到的是未经任何处理的字节
                 .addLast("ioStats", ioStats)
@@ -121,6 +126,20 @@ public class TcpServer {
         boss.shutdownGracefully(0, 5, TimeUnit.SECONDS).syncUninterruptibly();
         serverChannel = null;
         log.info("{}已停止", name);
+    }
+
+    /**
+     * 连接数上限，要在 {@link #start()} 之前设置。0 表示不限
+     *
+     * @param maxConnections 总连接数
+     * @param maxPerIp       单个 IP 的连接数（终端走运营商专网时很多车共用出口 IP，谨慎设置）
+     */
+    public void setConnectionLimits(int maxConnections, int maxPerIp) {
+        this.limiter = maxConnections > 0 || maxPerIp > 0 ? new ConnectionLimiter(name, maxConnections, maxPerIp) : null;
+    }
+
+    public ConnectionLimiter getLimiter() {
+        return limiter;
     }
 
     /**

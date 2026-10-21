@@ -51,6 +51,8 @@ import java.util.regex.Pattern;
  * 终端 ──TCP 1078 码流──▶ 回放流端口 ─┴─▶ 帧重组 ─▶ FLV ─▶ 流 ─┤
  *                                                           └─▶ 浏览器 GET /live/13800138000_1_pb.flv?token=…
  * </pre>
+ * 声音单独一路：GET /live/{流}.audio?token=…（格式见 {@link MediaStream} 的音频说明），页面点了“声音”才拉。
+ * <p>
  * 实时和回放分两个端口：同一个通道可能一边看实时、一边看回放，码流里分不出是哪一路。
  * <p>
  * 和 808 信令服务分开：信令只是几条小消息，视频是持续的大流量，两者分开部署、各自扩容。
@@ -58,7 +60,7 @@ import java.util.regex.Pattern;
 public class MediaServer {
 
     private static final Logger log = LoggerFactory.getLogger(MediaServer.class);
-    private static final Pattern PATH = Pattern.compile(".*/live/([0-9A-Za-z_]+)\\.flv$");
+    private static final Pattern PATH = Pattern.compile(".*/live/([0-9A-Za-z_]+)\\.(flv|audio)$");
 
     private final StreamHub hub;
     private final String bindAddress;
@@ -222,6 +224,7 @@ public class MediaServer {
     private final class HttpFlvHandler extends SimpleChannelInboundHandler<FullHttpRequest> implements MediaStream.Subscriber {
         private String key;
         private Channel channel;
+        private boolean audio;
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
@@ -233,20 +236,26 @@ public class MediaServer {
                 return;
             }
             String k = m.group(1);
+            boolean wantAudio = "audio".equals(m.group(2));
             List<String> token = qs.parameters().get("token");
             if (!hub.authorizer().allowPlay(k, token == null || token.isEmpty() ? "" : token.get(0))) {
                 respond(ctx, HttpResponseStatus.FORBIDDEN, "forbidden");
                 return;
             }
             HttpResponse resp = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
-            resp.headers().set(HttpHeaderNames.CONTENT_TYPE, "video/x-flv");
+            resp.headers().set(HttpHeaderNames.CONTENT_TYPE, wantAudio ? "application/octet-stream" : "video/x-flv");
             resp.headers().set(HttpHeaderNames.CACHE_CONTROL, "no-cache");
             resp.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_ORIGIN, "*");
             resp.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE);
             HttpUtil.setTransferEncodingChunked(resp, true);
             ctx.writeAndFlush(resp);
             key = k;
-            hub.subscribe(k, this);
+            audio = wantAudio;
+            if (wantAudio) {
+                hub.subscribeAudio(k, this);
+            } else {
+                hub.subscribe(k, this);
+            }
         }
 
         private void respond(ChannelHandlerContext ctx, HttpResponseStatus status, String text) {
@@ -289,7 +298,9 @@ public class MediaServer {
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            if (key != null) {
+            if (key != null && audio) {
+                hub.unsubscribeAudio(key, this);
+            } else if (key != null) {
                 hub.unsubscribe(key, this);
             }
         }

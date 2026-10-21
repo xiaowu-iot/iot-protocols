@@ -20,6 +20,7 @@ import io.github.xiaowuiot.protocol.jt808.codec.Jt808Subpackages;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
+import io.netty.util.AttributeKey;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -177,14 +178,121 @@ public class Jt808CommandSender {
         sentPackets(session).put(packets.get(0).getHeader().getSerialNo(), packets);
         int lastSerial = packets.get(packets.size() - 1).getHeader().getSerialNo();
         CompletableFuture<Jt808Message> future = pending.register(deviceId, lastSerial, timeout, unit);
-        for (Jt808Message packet : packets) {
-            session.write(packet).addListener(f -> {
-                if (!f.isSuccess()) {
-                    pending.fail(deviceId, lastSerial, f.cause());
+        Upload upload = new Upload(session, packets, uploadWindow, uploadAckTimeoutMillis,
+                e -> pending.fail(deviceId, lastSerial, e));
+        future.whenComplete((r, e) -> upload.finish());
+        upload.start();
+        return future;
+    }
+
+    /** 分包下发的窗口：最多几包没收到应答，0 表示不限（一次全部写出） */
+    private volatile int uploadWindow = 8;
+    /** 一包等多久应答，超时就当它收到了继续发：有的终端只回最后一包的应答 */
+    private volatile long uploadAckTimeoutMillis = 3000;
+
+    /**
+     * 分包下发的流控参数。升级包这种几百包的消息一口气写出去，很多终端会丢包甚至断开
+     *
+     * @param window          最多几包没收到应答，0 表示不限
+     * @param ackTimeoutMillis 一包等应答的时间，超时就继续发下一包
+     */
+    public void setUploadFlowControl(int window, long ackTimeoutMillis) {
+        this.uploadWindow = window;
+        this.uploadAckTimeoutMillis = ackTimeoutMillis;
+    }
+
+    /**
+     * 一组分包的发送进度：窗口里的包收到通用应答（或者等应答超时）才发下一包；连接写缓冲积压时暂停
+     */
+    private static final class Upload {
+        private static final AttributeKey<Map<Integer, Upload>> KEY = AttributeKey.valueOf("jt808.uploads");
+
+        final Session session;
+        final List<Jt808Message> packets;
+        final int window;
+        final long ackTimeoutMillis;
+        final java.util.function.Consumer<Throwable> onError;
+        final java.util.Set<Integer> inflight = new java.util.HashSet<>();
+        int next;
+        boolean finished;
+
+        Upload(Session session, List<Jt808Message> packets, int window, long ackTimeoutMillis,
+               java.util.function.Consumer<Throwable> onError) {
+            this.session = session;
+            this.packets = packets;
+            this.window = window <= 0 ? Integer.MAX_VALUE : window;
+            this.ackTimeoutMillis = ackTimeoutMillis;
+            this.onError = onError;
+        }
+
+        static Map<Integer, Upload> of(io.netty.channel.Channel ch) {
+            Map<Integer, Upload> m = ch.attr(KEY).get();
+            if (m == null) {
+                m = new java.util.concurrent.ConcurrentHashMap<>();
+                Map<Integer, Upload> old = ch.attr(KEY).setIfAbsent(m);
+                if (old != null) {
+                    m = old;
                 }
+            }
+            return m;
+        }
+
+        void start() {
+            runInLoop(this::pump);
+        }
+
+        void runInLoop(Runnable r) {
+            io.netty.channel.EventLoop loop = session.getChannel().eventLoop();
+            if (loop.inEventLoop()) {
+                r.run();
+            } else {
+                loop.execute(r);
+            }
+        }
+
+        /** 在连接的 IO 线程里执行 */
+        void pump() {
+            io.netty.channel.Channel ch = session.getChannel();
+            if (finished || !ch.isActive()) {
+                return;
+            }
+            while (next < packets.size() && inflight.size() < window) {
+                if (!ch.isWritable()) {
+                    // 写缓冲积压（网络慢）：等一会儿再发，不往内存里堆
+                    ch.eventLoop().schedule(this::pump, 20, TimeUnit.MILLISECONDS);
+                    return;
+                }
+                Jt808Message p = packets.get(next++);
+                int serial = p.getHeader().getSerialNo();
+                inflight.add(serial);
+                of(ch).put(serial, this);
+                ch.writeAndFlush(p).addListener(f -> {
+                    if (!f.isSuccess()) {
+                        onError.accept(f.cause());
+                    }
+                });
+                ch.eventLoop().schedule(() -> acked(serial), ackTimeoutMillis, TimeUnit.MILLISECONDS);
+            }
+        }
+
+        /** 收到这一包的通用应答，或者等应答超时 */
+        void acked(int serial) {
+            if (inflight.remove(serial)) {
+                of(session.getChannel()).remove(serial, this);
+                pump();
+            }
+        }
+
+        void finish() {
+            runInLoop(() -> {
+                finished = true;
+                Map<Integer, Upload> m = of(session.getChannel());
+                for (Jt808Message p : packets) {
+                    m.remove(p.getHeader().getSerialNo(), this);
+                }
+                inflight.clear();
             });
         }
-        return future;
     }
 
     /**
@@ -231,6 +339,14 @@ public class Jt808CommandSender {
      */
     public boolean onResponse(Session session, Jt808Message msg) {
         Integer replySerial = replySerialNo(msg.getBody());
+        if (replySerial != null && msg.getBody() instanceof GeneralResponse) {
+            // 分包下发中某一包的应答：推进发送窗口（最后一包的应答还要往下走，完成等待中的请求）
+            Map<Integer, Upload> uploads = session.getChannel().attr(Upload.KEY).get();
+            Upload u = uploads == null ? null : uploads.get(replySerial);
+            if (u != null) {
+                u.acked(replySerial);
+            }
+        }
         if (replySerial != null) {
             return pending.complete(session.getDeviceId(), replySerial, msg);
         }

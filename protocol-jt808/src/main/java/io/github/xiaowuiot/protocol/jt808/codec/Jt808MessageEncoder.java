@@ -5,6 +5,7 @@ import io.github.xiaowuiot.protocol.jt808.Jt808Header;
 import io.github.xiaowuiot.protocol.jt808.Jt808Message;
 import io.github.xiaowuiot.protocol.jt808.body.Jt808Body;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToByteEncoder;
@@ -22,7 +23,34 @@ public class Jt808MessageEncoder extends MessageToByteEncoder<Jt808Message> {
 
     @Override
     protected void encode(ChannelHandlerContext ctx, Jt808Message msg, ByteBuf out) {
-        encode(msg, out);
+        Jt808Rsa rsa = ctx.channel().attr(Jt808Rsa.KEY).get();
+        java.security.PublicKey terminalKey = ctx.channel().attr(Jt808Rsa.TERMINAL_KEY).get();
+        Jt808Header h = msg.getHeader();
+        boolean wanted = (h.getEncryption() & Jt808Rsa.RSA) != 0
+                || (rsa != null && rsa.isEncryptDownlink() && h.getMsgId() != io.github.xiaowuiot.protocol.jt808.MessageId.PLATFORM_RSA_KEY);
+        if (!wanted || terminalKey == null || rsa == null) {
+            if ((h.getEncryption() & Jt808Rsa.RSA) != 0) {
+                // 要求加密但还没拿到终端公钥：按明文发，不能把加密位带出去
+                h.setEncryption(h.getEncryption() & ~Jt808Rsa.RSA);
+            }
+            encode(msg, out);
+            return;
+        }
+        // RSA 加密：先把消息体按明文编出来，加密后作为原始字节写出，加密位置 1
+        ByteBuf plain = ctx.alloc().buffer();
+        try {
+            Object body = msg.getBody();
+            if (body instanceof Jt808Body) {
+                ((Jt808Body) body).encode(plain, h);
+            } else if (body instanceof byte[]) {
+                plain.writeBytes((byte[]) body);
+            }
+            byte[] cipherText = rsa.encrypt(terminalKey, ByteBufUtil.getBytes(plain));
+            h.setEncryption(h.getEncryption() | Jt808Rsa.RSA);
+            encode(new Jt808Message(h, cipherText), out);
+        } finally {
+            plain.release();
+        }
     }
 
     public static void encode(Jt808Message msg, ByteBuf out) {

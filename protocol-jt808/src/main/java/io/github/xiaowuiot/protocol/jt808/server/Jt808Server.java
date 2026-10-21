@@ -3,6 +3,7 @@ package io.github.xiaowuiot.protocol.jt808.server;
 import io.github.xiaowuiot.protocol.codec.server.TcpServer;
 import io.github.xiaowuiot.protocol.codec.session.SessionManager;
 import io.github.xiaowuiot.protocol.jt808.codec.Jt808Codecs;
+import io.github.xiaowuiot.protocol.jt808.codec.Jt808Rsa;
 
 /**
  * 808 接入服务。
@@ -25,13 +26,18 @@ public class Jt808Server {
                 b.authService != null ? b.authService : defaultAuthService(),
                 commandSender,
                 b.listener != null ? b.listener : Jt808MessageListener.NOOP);
+        handler.setAuthTimeoutSeconds(b.authTimeoutSeconds);
         this.server = new TcpServer("808 接入服务", Jt808CommandSender.PROTOCOL, b.port, b.idleSeconds, b.workerThreads,
                 pipeline -> {
+                    if (b.rsa != null) {
+                        pipeline.channel().attr(Jt808Rsa.KEY).set(b.rsa);
+                    }
                     Jt808Codecs.addTo(pipeline);
                     pipeline.addLast("handler", handler);
                 },
                 () -> sessions.closeAll(Jt808CommandSender.PROTOCOL));
         this.server.setBindAddress(b.bindAddress);
+        this.server.setConnectionLimits(b.maxConnections, b.maxConnectionsPerIp);
     }
 
     /**
@@ -81,6 +87,10 @@ public class Jt808Server {
         private SessionManager sessions;
         private Jt808AuthService authService;
         private Jt808MessageListener listener;
+        private int authTimeoutSeconds = 60;
+        private int maxConnections;
+        private int maxConnectionsPerIp;
+        private Jt808Rsa rsa;
 
         public Builder port(int port) {
             this.port = port;
@@ -126,6 +136,31 @@ public class Jt808Server {
 
         public Builder listener(Jt808MessageListener listener) {
             this.listener = listener;
+            return this;
+        }
+
+        /**
+         * 连上之后多少秒内必须完成鉴权，默认 60 秒，0 表示不限
+         */
+        public Builder authTimeoutSeconds(int authTimeoutSeconds) {
+            this.authTimeoutSeconds = authTimeoutSeconds;
+            return this;
+        }
+
+        /**
+         * 连接数上限，0 表示不限。终端走运营商专网时很多车共用出口 IP，单 IP 上限要按现场设
+         */
+        public Builder connectionLimits(int maxConnections, int maxPerIp) {
+            this.maxConnections = maxConnections;
+            this.maxConnectionsPerIp = maxPerIp;
+            return this;
+        }
+
+        /**
+         * 支持 RSA 加密的消息（消息体属性 bit10）：终端发 0x0A00 上报公钥后，平台回 0x8A00 平台公钥。不设置时收到加密消息会丢弃
+         */
+        public Builder rsa(Jt808Rsa rsa) {
+            this.rsa = rsa;
             return this;
         }
 

@@ -15,6 +15,7 @@ import io.github.xiaowuiot.protocol.jt808.body.Register;
 import io.github.xiaowuiot.protocol.jt808.body.RegisterResponse;
 import io.github.xiaowuiot.protocol.jt808.codec.BodyDecoders;
 import io.github.xiaowuiot.protocol.jt808.codec.Jt808Codecs;
+import io.github.xiaowuiot.protocol.jt808.codec.Jt808Rsa;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
@@ -30,6 +31,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.Collections;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -55,6 +57,15 @@ public class Jt808ServerHandler extends SimpleChannelInboundHandler<Jt808Message
     private final Jt808AuthService authService;
     private final Jt808CommandSender commandSender;
     private final Jt808MessageListener listener;
+
+    /**
+     * 连上之后多少秒内必须完成鉴权，0 表示不限。只连不鉴权（或者只发心跳）的连接会一直占着资源
+     */
+    private volatile int authTimeoutSeconds = 60;
+
+    public void setAuthTimeoutSeconds(int authTimeoutSeconds) {
+        this.authTimeoutSeconds = authTimeoutSeconds;
+    }
 
     public Jt808ServerHandler(SessionManager sessions, Jt808AuthService authService,
                               Jt808CommandSender commandSender, Jt808MessageListener listener) {
@@ -110,6 +121,22 @@ public class Jt808ServerHandler extends SimpleChannelInboundHandler<Jt808Message
                 reply(ctx, header, GeneralResponse.SUCCESS);
                 commandSender.resend(session, msg.<LinkBodies.ResendRequest>getBody());
                 break;
+            case MessageId.TERMINAL_RSA_KEY: {
+                // 终端上报公钥：记在连接上，之后发给它的消息可以用它加密；再把平台公钥发给它
+                Jt808Rsa rsa = ctx.channel().attr(Jt808Rsa.KEY).get();
+                try {
+                    Jt808Rsa.setTerminalKey(ctx.channel(), msg.getBody());
+                    reply(ctx, header, GeneralResponse.SUCCESS);
+                } catch (IllegalArgumentException e) {
+                    reply(ctx, header, GeneralResponse.MESSAGE_ERROR);
+                    break;
+                }
+                if (rsa != null) {
+                    ctx.writeAndFlush(new Jt808Message(Jt808Header.to(header, MessageId.PLATFORM_RSA_KEY, session.nextSerialNo()),
+                            rsa.platformPublicKey()));
+                }
+                break;
+            }
             case MessageId.LOGOUT:
                 // 注销后终端需要重新注册，先应答再断开
                 reply(ctx, header, GeneralResponse.SUCCESS).addListener(ChannelFutureListener.CLOSE);
@@ -254,6 +281,16 @@ public class Jt808ServerHandler extends SimpleChannelInboundHandler<Jt808Message
     public void channelActive(ChannelHandlerContext ctx) {
         log.debug("{} 新连接", ctx.channel());
         sessions.connected(Jt808CommandSender.PROTOCOL, ctx.channel());
+        int timeout = authTimeoutSeconds;
+        if (timeout > 0) {
+            ctx.executor().schedule(() -> {
+                if (ctx.channel().isActive() && SessionManager.get(ctx.channel()) == null) {
+                    log.info("{} 连上 {} 秒还没有鉴权，断开", ctx.channel(), timeout);
+                    SessionManager.closeReason(ctx.channel(), "超过 " + timeout + " 秒没有鉴权");
+                    ctx.close();
+                }
+            }, timeout, TimeUnit.SECONDS);
+        }
         ctx.fireChannelActive();
     }
 

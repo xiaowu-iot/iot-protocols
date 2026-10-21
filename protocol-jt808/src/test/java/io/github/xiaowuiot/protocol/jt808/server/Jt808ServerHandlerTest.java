@@ -34,6 +34,7 @@ import static io.github.xiaowuiot.protocol.jt808.Jt808TestSupport.channel;
 import static io.github.xiaowuiot.protocol.jt808.Jt808TestSupport.encodeHex;
 import static io.github.xiaowuiot.protocol.jt808.Jt808TestSupport.writeHex;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -227,6 +228,45 @@ class Jt808ServerHandlerTest {
     }
 
     @Test
+    void subpackagesSentThroughWindow() {
+        login();
+        sender.setUploadFlowControl(2, 60_000);
+        byte[] big = new byte[4500];
+        CompletableFuture<Jt808Message> f = sender.sendLarge("13800138000", MessageId.PASS_THROUGH_DOWN,
+                new PassThrough(0x41, big), 3, TimeUnit.SECONDS);
+        // 5 包，窗口 2：先只发 2 包
+        Jt808Message p1 = readOutbound();
+        Jt808Message p2 = readOutbound();
+        assertNotNull(p2);
+        assertNull(readOutbound());
+        // 第 1 包应答后发第 3 包
+        ack(p1);
+        Jt808Message p3 = readOutbound();
+        assertEquals(3, p3.getHeader().getPacketNo());
+        assertNull(readOutbound());
+        ack(p2);
+        ack(p3);
+        Jt808Message p4 = readOutbound();
+        Jt808Message p5 = readOutbound();
+        assertEquals(5, p5.getHeader().getPacketNo());
+        ack(p4);
+        ack(p5);
+        // 最后一包的应答完成整个请求
+        assertTrue(f.isDone());
+    }
+
+    @Test
+    void unauthenticatedConnectionClosedAfterTimeout() throws Exception {
+        Jt808ServerHandler h = new Jt808ServerHandler(sessions, new InMemoryAuthService(), sender,
+                (s, msg) -> CompletableFuture.completedFuture(null));
+        h.setAuthTimeoutSeconds(1);
+        EmbeddedChannel c = channel(h);
+        Thread.sleep(1100);
+        c.runPendingTasks();
+        assertFalse(c.isActive());
+    }
+
+    @Test
     void version2011RememberedAcrossReconnect() {
         InMemoryAuthService auth = new InMemoryAuthService();
         EmbeddedChannel c1 = channel(new Jt808ServerHandler(sessions, auth, sender, (s, msg) -> {
@@ -257,6 +297,18 @@ class Jt808ServerHandlerTest {
         RegisterResponse rr = send(MessageId.REGISTER, new Register().setMakerId("TEST1").setModel("M1")
                 .setTerminalId("T000001").setPlate("粤B12345")).getBody();
         send(MessageId.AUTH, new Auth(rr.getAuthCode()));
+    }
+
+    /**
+     * 终端回一条通用应答（平台不会再回应答，所以不读出站）
+     */
+    private void ack(Jt808Message platformMsg) {
+        Jt808Header h = new Jt808Header();
+        h.setMsgId(MessageId.TERMINAL_GENERAL_RESPONSE);
+        h.setPhone("013800138000");
+        h.setSerialNo(terminalSerial++);
+        writeHex(ch, encodeHex(new Jt808Message(h, new GeneralResponse(platformMsg.getHeader().getSerialNo(),
+                platformMsg.getHeader().getMsgId(), 0))));
     }
 
     /**

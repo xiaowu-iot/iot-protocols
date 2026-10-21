@@ -41,6 +41,13 @@ public class MediaStream {
     private byte[] pps;
     private long baseTimestamp = -1;
     private int lastTagTimestamp;
+    private long maxPts;
+    private int reorderDelay;
+    private static final int MAX_REORDER_MS = 1000;
+    public static final int AUDIO_PCM = 1;
+    public static final int AUDIO_AAC = 2;
+    private final List<Subscriber> audioSubs = new CopyOnWriteArrayList<>();
+    private volatile String audioPayload = "";
     private final AtomicLong frames = new AtomicLong();
     private final AtomicLong bytesIn = new AtomicLong();
     private volatile long lastFrameAt;
@@ -127,7 +134,7 @@ public class MediaStream {
             return;
         }
         if (!f.isVideo()) {
-            // 音频：第一版先不分发（浏览器端解 G.711 留到后面）
+            onAudio(f);
             return;
         }
         frames.incrementAndGet();
@@ -140,12 +147,22 @@ public class MediaStream {
             baseTimestamp = f.timestamp;
         }
         long rel = f.timestamp - baseTimestamp;
-        // 时间戳跳变（终端重启、时钟调整）：按上一帧 + 40ms 续上，播放器看到的时间线始终单调
-        if (rel < lastTagTimestamp || rel - lastTagTimestamp > 10_000) {
-            baseTimestamp = f.timestamp - lastTagTimestamp - 40;
-            rel = lastTagTimestamp + 40;
+        // 时间戳跳变（终端重启、时钟调整）：按上一帧 + 40ms 续上，播放器看到的时间线始终单调。
+        // 有 B 帧时显示时间本来就会往回走一点（B 帧显示在它前面解码的 P 帧之前），1 秒以内不算跳变
+        if (rel < maxPts - MAX_REORDER_MS || rel - maxPts > 10_000) {
+            baseTimestamp = f.timestamp - maxPts - 40;
+            rel = maxPts + 40;
+            reorderDelay = 0;
         }
-        int ts = (int) rel;
+        // 1078 包里的时间戳是显示时间（PTS），FLV tag 的时间戳是解码时间（DTS），差值写在 CTS 里。
+        // 没有 B 帧时两者相同；出现 B 帧（显示时间比已解码的帧早）后，按观察到的最大回退量估算重排延迟，
+        // DTS = PTS - 重排延迟，并保证 DTS 严格递增
+        if (rel < maxPts) {
+            reorderDelay = (int) Math.min(MAX_REORDER_MS, Math.max(reorderDelay, maxPts - rel));
+        }
+        maxPts = Math.max(maxPts, rel);
+        int ts = (int) Math.max(frames.get() > 1 ? lastTagTimestamp + 1 : 0, rel - reorderDelay);
+        int cts = (int) Math.max(0, rel - ts);
         lastTagTimestamp = ts;
         boolean changed = false;
         // H.265 的序列头要 VPS + SPS + PPS，缺 VPS 时先不建，否则播放器按 HEVC 解 AVC 序列头会直接失败
@@ -176,7 +193,7 @@ public class MediaStream {
             return;
         }
         boolean key = f.isKey() || s.idr;
-        ByteBuf tag = FlvMuxer.videoTag(alloc, codec, key, s.nals, ts);
+        ByteBuf tag = FlvMuxer.videoTag(alloc, codec, key, s.nals, ts, cts);
         if (key) {
             clearGop();
         }
@@ -208,6 +225,57 @@ public class MediaStream {
         tag.release();
     }
 
+    /**
+     * 音频单独分发（{@code /live/{流}.audio}）：每块是 1 字节类型 + 3 字节长度 + 数据。
+     * 类型 1 是 16 位小端 PCM（8000 Hz 单声道，G.711 / ADPCM 在这里解码），类型 2 是 AAC（ADTS，浏览器解码）。
+     * 音频没有参考帧，写不进去的块直接丢，不用等关键帧。
+     */
+    private void onAudio(FrameAssembler.Frame f) {
+        audioPayload = Jt1078Packet.payloadName(f.payloadType);
+        if (audioSubs.isEmpty()) {
+            return;
+        }
+        int type;
+        byte[] data;
+        if (AudioCodec.decodable(f.payloadType)) {
+            type = AUDIO_PCM;
+            data = AudioCodec.toPcm(f.payloadType, f.data);
+        } else if (f.payloadType == Jt1078Packet.PT_AAC) {
+            type = AUDIO_AAC;
+            data = AudioCodec.stripHisiHeader(f.data);
+        } else {
+            return;
+        }
+        if (data == null || data.length == 0 || data.length > 0xFFFFFF) {
+            return;
+        }
+        ByteBuf chunk = alloc.buffer(4 + data.length);
+        chunk.writeByte(type);
+        chunk.writeMedium(data.length);
+        chunk.writeBytes(data);
+        for (Subscriber sub : audioSubs) {
+            sub.write(chunk.retainedDuplicate());
+        }
+        chunk.release();
+    }
+
+    public synchronized void addAudioSubscriber(Subscriber s) {
+        if (closed) {
+            s.close();
+            return;
+        }
+        audioSubs.add(s);
+    }
+
+    public synchronized void removeAudioSubscriber(Subscriber s) {
+        audioSubs.remove(s);
+    }
+
+    /** 收到的音频格式，没收到过是空字符串 */
+    public String audioPayload() {
+        return audioPayload;
+    }
+
     private void clearGop() {
         gop.forEach(ByteBuf::release);
         gop.clear();
@@ -220,6 +288,8 @@ public class MediaStream {
             sub.s.close();
         }
         subs.clear();
+        audioSubs.forEach(Subscriber::close);
+        audioSubs.clear();
         clearGop();
         if (sequenceHeader != null) {
             sequenceHeader.release();

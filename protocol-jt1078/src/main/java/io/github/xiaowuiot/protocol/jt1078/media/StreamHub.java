@@ -188,6 +188,25 @@ public class StreamHub {
         log.info("{} 开始观看 {}，当前 {} 人", sub.id(), key, s.subscriberCount());
     }
 
+    /**
+     * 听这路流的声音。声音跟着画面走：没人看画面的流不能单独听（不算观看人数，画面关了声音一起断）
+     */
+    public synchronized void subscribeAudio(String key, MediaStream.Subscriber sub) {
+        MediaStream s = streams.get(key);
+        if (s == null) {
+            sub.close();
+            return;
+        }
+        s.addAudioSubscriber(sub);
+    }
+
+    public synchronized void unsubscribeAudio(String key, MediaStream.Subscriber sub) {
+        MediaStream s = streams.get(key);
+        if (s != null) {
+            s.removeAudioSubscriber(sub);
+        }
+    }
+
     public synchronized void unsubscribe(String key, MediaStream.Subscriber sub) {
         MediaStream s = streams.get(key);
         if (s == null) {

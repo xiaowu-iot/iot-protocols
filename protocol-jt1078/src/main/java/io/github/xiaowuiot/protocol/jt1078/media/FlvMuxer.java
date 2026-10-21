@@ -110,6 +110,16 @@ public final class FlvMuxer {
      * @param nals 不含参数集的 NAL
      */
     public static ByteBuf videoTag(ByteBufAllocator alloc, int codec, boolean key, List<byte[]> nals, int timestamp) {
+        return videoTag(alloc, codec, key, nals, timestamp, 0);
+    }
+
+    /**
+     * 一帧视频
+     *
+     * @param timestamp 解码时间（DTS）
+     * @param cts       显示时间减解码时间（有 B 帧时 I / P 帧大于 0）
+     */
+    public static ByteBuf videoTag(ByteBufAllocator alloc, int codec, boolean key, List<byte[]> nals, int timestamp, int cts) {
         int len = 5;
         for (byte[] n : nals) {
             len += 4 + n.length;
@@ -118,7 +128,7 @@ public final class FlvMuxer {
         tagHeader(b, 9, len, timestamp);
         b.writeByte((key ? 0x10 : 0x20) | codec);
         b.writeByte(1);
-        b.writeMedium(0);
+        b.writeMedium(cts);
         for (byte[] n : nals) {
             b.writeInt(n.length);
             b.writeBytes(n);
