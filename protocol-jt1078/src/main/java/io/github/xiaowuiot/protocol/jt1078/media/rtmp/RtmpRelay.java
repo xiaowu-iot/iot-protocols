@@ -29,6 +29,7 @@ public class RtmpRelay {
     private final Function<String, String> urlOf;
     private final EventLoopGroup group = new NioEventLoopGroup(1);
     private final Map<String, RtmpPublisher> publishers = new ConcurrentHashMap<>();
+    private volatile boolean audio = true;
 
     /**
      * @param urlOf 流标识 → 转推地址，返回 null 表示这路流不转推（比如只转推实时视频、不转推回放）
@@ -62,9 +63,17 @@ public class RtmpRelay {
             log.warn("{} 不转推：{}", key, e.getMessage());
             return;
         }
+        p.setAudio(audio);
         publishers.put(key, p);
         stream.onClose(() -> publishers.remove(key, p));
         p.start();
+    }
+
+    /**
+     * 是否转推声音，见 {@link RtmpPublisher#setAudio}
+     */
+    public void setAudio(boolean audio) {
+        this.audio = audio;
     }
 
     public void stop(String key) {

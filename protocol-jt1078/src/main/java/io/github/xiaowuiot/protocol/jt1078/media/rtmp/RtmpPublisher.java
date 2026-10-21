@@ -63,6 +63,7 @@ public class RtmpPublisher implements MediaStream.Subscriber {
     private volatile Channel channel;
     private volatile int streamId;
     private volatile boolean stopped;
+    private volatile boolean audio = true;
     private volatile long bytesOut;
     private volatile long publishedAt;
     private int retryDelay = 2;
@@ -253,7 +254,15 @@ public class RtmpPublisher implements MediaStream.Subscriber {
 
     @Override
     public boolean flvAudio() {
-        return true;
+        return audio;
+    }
+
+    /**
+     * 是否转推声音（默认是）。浏览器里的 FLV / HLS 播放器（mpegts.js、hls.js）不认 G.711，
+     * 对端用这类播放器又不走 WebRTC 时可以关掉，只推画面
+     */
+    public void setAudio(boolean audio) {
+        this.audio = audio;
     }
 
     // ==================== 命令交互 ====================

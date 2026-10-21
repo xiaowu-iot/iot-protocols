@@ -356,6 +356,7 @@ sequenceDiagram
 - 声音：G.711 原样发（FLV 编码 7 / 8，ZLMediaKit 支持），ADPCM 先解码再转成 G.711A，AAC 去掉 ADTS 头、先发 AudioSpecificConfig
 - 转推跟着平台的按需拉流走：平台里有人看、终端在推才会转推；转推本身不让流一直开着
 - 对端收得慢时丢帧到下一个关键帧，不影响平台自己的观看者
+- 已和 ZLMediaKit（2026-10 master 版）联调：识别为 H.264 + PCMA，FLV、HLS 都能拉到，对端重启后几秒内自动重连。网页里的 FLV / HLS 播放器不认 G.711，播放 ZLMediaKit 的 FLV 时要设 `hasAudio: false`，要声音走 WebRTC；也可以 `RtmpRelay.setAudio(false)` 只推画面
 
 ### 4. HJ 212 污染物在线监测
 
