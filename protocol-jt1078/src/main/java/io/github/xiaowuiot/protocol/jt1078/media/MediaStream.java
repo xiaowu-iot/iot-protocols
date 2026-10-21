@@ -25,9 +25,15 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class MediaStream {
 
+    /** GOP 缓存上限：关键帧间隔异常大（或者终端一直不发关键帧）时不能无限涨 */
+    private static final int MAX_GOP_FRAMES = 300;
+    private static final long MAX_GOP_BYTES = 16L * 1024 * 1024;
+
     private final String key;
     private final ByteBufAllocator alloc = PooledByteBufAllocator.DEFAULT;
     private final List<ByteBuf> gop = new ArrayList<>();
+    private long gopBytes;
+    private boolean closed;
     private ByteBuf sequenceHeader;
     private int codec = FlvMuxer.CODEC_AVC;
     private byte[] vps;
@@ -63,6 +69,8 @@ public class MediaStream {
     private static final class Sub {
         final Subscriber s;
         boolean waitingKey;
+        /** 序列头没写进去：下一个关键帧之前要先补发序列头 */
+        boolean needHeader;
 
         Sub(Subscriber s) {
             this.s = s;
@@ -72,16 +80,34 @@ public class MediaStream {
     private final List<Sub> subs = new CopyOnWriteArrayList<>();
 
     public synchronized void addSubscriber(Subscriber s) {
+        if (closed) {
+            // 流刚被关掉（没人看、等推流超时）：观看者直接断开，页面会重新请求
+            s.close();
+            return;
+        }
         Sub sub = new Sub(s);
         subs.add(sub);
         s.write(FlvMuxer.header(alloc, false));
-        if (sequenceHeader != null) {
-            s.write(sequenceHeader.retainedDuplicate());
-            for (ByteBuf tag : gop) {
-                s.write(tag.retainedDuplicate());
-            }
-        } else {
+        if (sequenceHeader == null) {
             sub.waitingKey = true;
+            sub.needHeader = true;
+            return;
+        }
+        if (!s.write(sequenceHeader.retainedDuplicate())) {
+            sub.waitingKey = true;
+            sub.needHeader = true;
+            return;
+        }
+        if (gop.isEmpty()) {
+            sub.waitingKey = true;
+            return;
+        }
+        // 秒开：整组画面一起发。中途写不进去就停，后面的 P 帧没有参考帧会花屏，等下一个关键帧
+        for (ByteBuf tag : gop) {
+            if (!s.write(tag.retainedDuplicate())) {
+                sub.waitingKey = true;
+                break;
+            }
         }
     }
 
@@ -97,6 +123,9 @@ public class MediaStream {
      * 收齐的一帧
      */
     public synchronized void onFrame(FrameAssembler.Frame f) {
+        if (closed) {
+            return;
+        }
         if (!f.isVideo()) {
             // 音频：第一版先不分发（浏览器端解 G.711 留到后面）
             return;
@@ -119,7 +148,9 @@ public class MediaStream {
         int ts = (int) rel;
         lastTagTimestamp = ts;
         boolean changed = false;
-        if (s.sps != null && s.pps != null && (sps == null || !Arrays.equals(sps, s.sps) || !Arrays.equals(pps, s.pps))) {
+        // H.265 的序列头要 VPS + SPS + PPS，缺 VPS 时先不建，否则播放器按 HEVC 解 AVC 序列头会直接失败
+        if (s.sps != null && s.pps != null && (!hevc || s.vps != null)
+                && (sps == null || !Arrays.equals(sps, s.sps) || !Arrays.equals(pps, s.pps))) {
             sps = s.sps;
             pps = s.pps;
             vps = s.vps;
@@ -130,10 +161,15 @@ public class MediaStream {
             if (sequenceHeader != null) {
                 sequenceHeader.release();
             }
-            sequenceHeader = hevc && vps != null ? FlvMuxer.hevcSequenceHeader(alloc, vps, sps, pps, ts)
+            sequenceHeader = hevc ? FlvMuxer.hevcSequenceHeader(alloc, vps, sps, pps, ts)
                     : FlvMuxer.avcSequenceHeader(alloc, sps, pps, ts);
             for (Sub sub : subs) {
-                sub.s.write(sequenceHeader.retainedDuplicate());
+                if (!sub.s.write(sequenceHeader.retainedDuplicate())) {
+                    sub.needHeader = true;
+                    sub.waitingKey = true;
+                } else {
+                    sub.needHeader = false;
+                }
             }
         }
         if (sequenceHeader == null || s.nals.isEmpty()) {
@@ -142,20 +178,26 @@ public class MediaStream {
         boolean key = f.isKey() || s.idr;
         ByteBuf tag = FlvMuxer.videoTag(alloc, codec, key, s.nals, ts);
         if (key) {
-            gop.forEach(ByteBuf::release);
-            gop.clear();
+            clearGop();
         }
         if (key || !gop.isEmpty()) {
             gop.add(tag.retain());
-            // GOP 太长（关键帧间隔异常大）时只留后面的，防止内存涨上去
-            while (gop.size() > 300) {
-                gop.remove(0).release();
+            gopBytes += tag.readableBytes();
+            if (gop.size() > MAX_GOP_FRAMES || gopBytes > MAX_GOP_BYTES) {
+                // 不能只删开头：删掉关键帧后新观看者先收到一串 P 帧会花屏。整组清掉，新观看者等下一个关键帧
+                clearGop();
             }
         }
         for (Sub sub : subs) {
             if (sub.waitingKey) {
                 if (!key) {
                     continue;
+                }
+                if (sub.needHeader) {
+                    if (!sub.s.write(sequenceHeader.retainedDuplicate())) {
+                        continue;
+                    }
+                    sub.needHeader = false;
                 }
                 sub.waitingKey = false;
             }
@@ -166,13 +208,19 @@ public class MediaStream {
         tag.release();
     }
 
+    private void clearGop() {
+        gop.forEach(ByteBuf::release);
+        gop.clear();
+        gopBytes = 0;
+    }
+
     public synchronized void close() {
+        closed = true;
         for (Sub sub : subs) {
             sub.s.close();
         }
         subs.clear();
-        gop.forEach(ByteBuf::release);
-        gop.clear();
+        clearGop();
         if (sequenceHeader != null) {
             sequenceHeader.release();
             sequenceHeader = null;
@@ -197,6 +245,10 @@ public class MediaStream {
 
     public long createdAt() {
         return createdAt;
+    }
+
+    public synchronized boolean isClosed() {
+        return closed;
     }
 
     public boolean isPublishing() {

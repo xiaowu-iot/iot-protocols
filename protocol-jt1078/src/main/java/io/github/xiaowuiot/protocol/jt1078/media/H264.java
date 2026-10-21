@@ -65,6 +65,23 @@ public final class H264 {
         }
     }
 
+    /**
+     * 去掉防竞争字节：编码器在 NAL 里遇到 00 00 后面跟 00~03 时插入一个 03，按位读字段之前要先去掉
+     */
+    public static byte[] removeEmulationPrevention(byte[] nal) {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(nal.length);
+        int zeros = 0;
+        for (byte b : nal) {
+            if (zeros >= 2 && b == 3) {
+                zeros = 0;
+                continue;
+            }
+            zeros = b == 0 ? zeros + 1 : 0;
+            out.write(b);
+        }
+        return out.toByteArray();
+    }
+
     public static int type(byte[] nal) {
         return nal[0] & 0x1F;
     }

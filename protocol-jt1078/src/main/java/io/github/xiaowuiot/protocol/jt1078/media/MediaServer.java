@@ -152,6 +152,7 @@ public class MediaServer {
         private final boolean playback;
         private final Map<String, FrameAssembler> assemblers = new HashMap<>();
         private final Map<String, MediaStream> streams = new HashMap<>();
+        private final java.util.Set<String> rejected = new java.util.HashSet<>();
 
         IngestHandler(boolean playback) {
             this.playback = playback;
@@ -163,17 +164,29 @@ public class MediaServer {
             String key = p.streamKey() + (playback ? "_pb" : "");
             MediaStream s = streams.get(key);
             if (s == null) {
-                if (!hub.authorizer().allowPublish(key)) {
-                    log.warn("{} 推流 {} 没有经过平台请求，断开", ctx.channel().remoteAddress(), key);
-                    ctx.close();
+                if (rejected.contains(key)) {
                     return;
                 }
-                s = hub.publish(key);
+                if (!hub.authorizer().allowPublish(key)) {
+                    if (streams.isEmpty()) {
+                        log.warn("{} 推流 {} 没有经过平台请求，断开", ctx.channel().remoteAddress(), key);
+                        ctx.close();
+                    } else {
+                        // 同一条连接上别的通道是平台请求过的：只丢这个通道的数据，不影响正在看的通道
+                        log.warn("{} 推流 {} 没有经过平台请求，丢弃这个通道的数据", ctx.channel().remoteAddress(), key);
+                        rejected.add(key);
+                    }
+                    return;
+                }
+                Channel ch = ctx.channel();
+                s = hub.publish(key, ch, ch::close);
                 streams.put(key, s);
                 assemblers.put(key, new FrameAssembler());
                 log.info("{} 推流 {}（{}）", ctx.channel().remoteAddress(), key, Jt1078Packet.payloadName(p.payloadType));
-            }
-            if (p.dataType == Jt1078Packet.TYPE_PASSTHROUGH) {
+            } else if (s.isClosed()) {
+                // 没人看了、平台已经下发 0x9102，终端还在推：断开连接，终端就停了
+                log.info("{} 流 {} 已关闭，断开推流连接", ctx.channel().remoteAddress(), key);
+                ctx.close();
                 return;
             }
             FrameAssembler.Frame f = assemblers.get(key).add(p);
@@ -184,7 +197,8 @@ public class MediaServer {
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            streams.forEach(hub::unpublish);
+            Channel ch = ctx.channel();
+            streams.keySet().forEach(k -> hub.unpublish(k, ch));
             streams.clear();
         }
 

@@ -63,6 +63,8 @@ public final class FlvMuxer {
      * 解码器实际依赖的是后面带的 VPS / SPS / PPS 数组）
      */
     public static ByteBuf hevcSequenceHeader(ByteBufAllocator alloc, byte[] vps, byte[] sps, byte[] pps, int timestamp) {
+        // 读 profile 等字段要先去掉防竞争字节（00 00 03 里的 03），否则字段会错位；后面写进序列头的还是原始 SPS
+        byte[] rbsp = H264.removeEmulationPrevention(sps);
         byte[][] arrays = {vps, sps, pps};
         int[] types = {H264.HEVC_VPS, H264.HEVC_SPS, H264.HEVC_PPS};
         int len = 5 + 23;
@@ -76,14 +78,14 @@ public final class FlvMuxer {
         b.writeMedium(0);
         // profile_tier_level 在 SPS 的第 3 个字节开始（2 字节 NAL 头 + 1 字节 sps_video_parameter_set_id 等）
         b.writeByte(1);
-        b.writeByte(sps.length > 3 ? sps[3] : 1);
+        b.writeByte(rbsp.length > 3 ? rbsp[3] : 1);
         for (int i = 0; i < 4; i++) {
-            b.writeByte(sps.length > 4 + i ? sps[4 + i] : 0);
+            b.writeByte(rbsp.length > 4 + i ? rbsp[4 + i] : 0);
         }
         for (int i = 0; i < 6; i++) {
-            b.writeByte(sps.length > 8 + i ? sps[8 + i] : 0);
+            b.writeByte(rbsp.length > 8 + i ? rbsp[8 + i] : 0);
         }
-        b.writeByte(sps.length > 14 ? sps[14] : 93);
+        b.writeByte(rbsp.length > 14 ? rbsp[14] : 93);
         b.writeShort(0xF000);
         b.writeByte(0xFC);
         b.writeByte(0xFD);
@@ -167,7 +169,10 @@ public final class FlvMuxer {
             } else {
                 int t = H264.type(n);
                 if (t == H264.NAL_SPS) {
-                    s.sps = n;
+                    // 序列头要用 SPS 的第 1~3 字节（profile、兼容性、level），太短的是坏数据，不能让它把连接搞断
+                    if (n.length >= 4) {
+                        s.sps = n;
+                    }
                 } else if (t == H264.NAL_PPS) {
                     s.pps = n;
                 } else if (t != H264.NAL_AUD) {
