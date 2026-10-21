@@ -24,6 +24,10 @@ List<Frame> frames = inspectors.get(protocol).inspect(data);  // 切帧、反转
 字段树里每个字段都带字节位置、原始十六进制、解释后的值和发现的问题（长度不对、校验错误……），适合做报文调试工具；
 `templates()` / `build()` 可以按模板填字段生成完整报文（帧头尾、转义、校验都算好）。
 
+下图是 jt-platform 里用它做的报文解析页：左边字段树带字节位置，右边点字节反查字段。
+
+![报文解析](docs/screenshots/jt-proto-inspect.jpg)
+
 ## 构建
 
 ```bash
@@ -395,6 +399,34 @@ flowchart LR
     F --> G["字段树：名称、位置、十六进制、解释后的值、问题"]
     H["模板 + 表单输入"] --> I["build：组包、转义、算校验"] --> E
 ```
+
+## 用这套协议库做的平台
+
+### 车辆智能监控平台（jt-platform）
+
+JT/T 808 全系列车辆监控平台，808、1078、809、主动安全、GB/T 32960、HJ 1239 的接入都用这个协议库。平台本身不开源，完整版源码在知识星球「小物学长的物联网实战营」：<https://t.zsxq.com/hldoY>
+
+**综合大屏**：车辆分布、实时报警、里程排行、主动安全抓拍
+
+![综合大屏](docs/screenshots/jt-screen.jpg)
+
+**业务场景大屏**：同一套大屏框架，按场景换左右两栏和指标，大屏左上角可以切换
+
+| 环卫收运：点位收运进度、漏收 | 公交：线路模拟图、到站准点率 |
+|---|---|
+| ![环卫收运大屏](docs/screenshots/jt-screen-waste.jpg) | ![公交大屏](docs/screenshots/jt-screen-bus.jpg) |
+| **急救：进行中的任务、各环节用时** | **校车：乘车人数、到站准点（不显示学生姓名）** |
+| ![急救大屏](docs/screenshots/jt-screen-ambulance.jpg) | ![校车大屏](docs/screenshots/jt-screen-school-bus.jpg) |
+
+| 实时监控 | 实时视频（1078，多画面） |
+|---|---|
+| ![实时监控](docs/screenshots/jt-monitor.jpg) | ![实时视频](docs/screenshots/jt-video.jpg) |
+| **轨迹回放：超速分段着色、停留点** | **主动安全：ADAS / DSM 报警和附件** |
+| ![轨迹回放](docs/screenshots/jt-track.jpg) | ![主动安全](docs/screenshots/jt-adas.jpg) |
+
+### 环境监测平台（env-monitor）
+
+HJ212 环境在线监测平台，开源基础版在 <https://github.com/xiaowu-iot/env-monitor>，截图和在线演示见那个仓库。
 
 ## 许可证
 
