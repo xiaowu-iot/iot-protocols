@@ -136,6 +136,43 @@ class Hj212V2025Test {
     }
 
     @Test
+    void commandsToEncryptingDeviceAreEncryptedWithItsKey() {
+        SessionManager sessions = new SessionManager();
+        Hj212CommandSender sender = new Hj212CommandSender(sessions);
+        Hj212Server.Handler handler = new Hj212Server.Handler(sessions, (mn, pw) -> true,
+                (s, p) -> CompletableFuture.completedFuture(null), sender, false);
+        Hj212Codecs.KeyLookup keys = mn -> MN.equals(mn) ? Arrays.asList(KEY) : new ArrayList<byte[]>();
+        EmbeddedChannel ch = new EmbeddedChannel(new ChannelInitializer<EmbeddedChannel>() {
+            @Override
+            protected void initChannel(EmbeddedChannel c) {
+                Hj212Codecs.addTo(c.pipeline(), keys);
+                c.pipeline().addLast(handler);
+            }
+        });
+        // 设备发来一条加密的实时数据（2025 版，Flag=8 不要求应答）
+        EmbeddedChannel enc = new EmbeddedChannel(new Hj212Codecs.Encoder());
+        enc.writeOutbound(Hj212Format.parse("QN=20240601085800000;ST=32;CN=2011;PW=123456;MN=" + MN + ";Flag=8;"
+                + "CP=&&DataTime=20240601085800;w01018-Rtd=40.1,w01018-Flag=N&&").encryptWith(KEY));
+        ByteBuf up = enc.readOutbound();
+        ch.writeInbound(up);
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("BeginTime", "20240601080000");
+        params.put("EndTime", "20240601090000");
+        sender.send(MN, "2061", params, 10);
+        ByteBuf down = ch.readOutbound();
+        byte[] bytes = ByteBufUtil.getBytes(down);
+        down.release();
+        // 数据命令要加密：线路上看不到明文的 BeginTime，用设备的密钥能解开
+        assertFalse(new String(bytes, StandardCharsets.ISO_8859_1).contains("BeginTime"));
+        EmbeddedChannel dec = codecChannel(keys);
+        dec.writeInbound(Unpooled.wrappedBuffer(bytes));
+        Hj212Packet decoded = dec.readInbound();
+        assertTrue(decoded.isEncrypted());
+        assertEquals("20240601080000", decoded.getParam("BeginTime"));
+    }
+
+    @Test
     void onlyDataKeyAndInfoCommandsAreEncrypted() {
         assertTrue(Hj212Crypto.mustEncrypt("2011"));
         assertTrue(Hj212Crypto.mustEncrypt("2062"));

@@ -89,11 +89,23 @@ public final class Hj212Split {
      * 没法也不需要按 QN 合并，所以 2025 版的分包原样逐包交出去
      */
     public static final class Assembler {
+        /** 总包数上限：历史数据一次也就几十包，离谱的 PNUM 直接当坏数据 */
+        private static final int MAX_PNUM = 512;
+        /** 一台设备同时在拼的组数、所有设备加起来的组数：每换一个 QN 就是一个新组，不限的话能被刷爆 */
+        private static final int MAX_GROUPS_PER_MN = 8;
+        private static final int MAX_GROUPS = 10000;
+
         private final long timeoutMillis;
         private final Map<String, Group> groups = new LinkedHashMap<>();
 
         private static final class Group {
             final long createdAt = System.currentTimeMillis();
+            final String mn;
+
+            Group(String mn) {
+                this.mn = mn;
+            }
+
             final TreeMap<Integer, Hj212Packet> parts = new TreeMap<>();
         }
 
@@ -108,11 +120,22 @@ public final class Hj212Split {
             if (!p.isSplit() || p.getPnum() == null || p.getPno() == null || p.version() >= Hj212Packet.VERSION_2025) {
                 return p;
             }
+            int pnum = p.getPnum();
+            int pno = p.getPno();
+            if (pnum < 1 || pnum > MAX_PNUM || pno < 1 || pno > pnum) {
+                // 越界的包序号也算进"收齐"的话，缺包时会拼出一个残缺的结果
+                return null;
+            }
             expire();
             String key = p.getMn() + "/" + p.getQn() + "/" + p.getCn();
-            Group g = groups.computeIfAbsent(key, k -> new Group());
-            g.parts.put(p.getPno(), p);
-            if (g.parts.size() < p.getPnum()) {
+            Group g = groups.get(key);
+            if (g == null) {
+                evictIfFull(p.getMn());
+                g = new Group(p.getMn());
+                groups.put(key, g);
+            }
+            g.parts.put(pno, p);
+            if (g.parts.size() < pnum) {
                 return null;
             }
             groups.remove(key);
@@ -129,6 +152,25 @@ public final class Hj212Split {
 
         public synchronized int pending() {
             return groups.size();
+        }
+
+        private void evictIfFull(String mn) {
+            int sameMn = 0;
+            String oldestOfMn = null;
+            for (Map.Entry<String, Group> e : groups.entrySet()) {
+                if (java.util.Objects.equals(e.getValue().mn, mn)) {
+                    if (oldestOfMn == null) {
+                        oldestOfMn = e.getKey();
+                    }
+                    sameMn++;
+                }
+            }
+            if (sameMn >= MAX_GROUPS_PER_MN) {
+                groups.remove(oldestOfMn);
+            }
+            if (groups.size() >= MAX_GROUPS) {
+                groups.remove(groups.keySet().iterator().next());
+            }
         }
 
         private void expire() {

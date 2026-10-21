@@ -104,8 +104,11 @@ public final class Hj212Codecs {
             byte[] data = ByteBufUtil.getBytes(frame, start + HEADER_LENGTH, dataLength);
             int actual = Checksums.crc16Hj212(data);
             boolean encrypted = false;
+            byte[] usedKey = null;
             if (expected != actual) {
-                data = decrypt(data, expected);
+                byte[][] used = new byte[1][];
+                data = decrypt(data, expected, used);
+                usedKey = used[0];
                 if (data == null) {
                     drop(ctx, frame, String.format("CRC 校验失败，报文中是 %04X，计算结果是 %04X", expected, actual));
                     return;
@@ -114,7 +117,7 @@ public final class Hj212Codecs {
             }
             try {
                 Hj212Packet p = Hj212Format.parse(new String(data, StandardCharsets.UTF_8));
-                out.add(encrypted ? p.markEncrypted() : p);
+                out.add(encrypted ? p.markEncrypted(usedKey) : p);
             } catch (IllegalArgumentException e) {
                 drop(ctx, frame, e.getMessage());
             }
@@ -125,7 +128,7 @@ public final class Hj212Codecs {
          *
          * @return 解密后的数据段，解不开返回 null
          */
-        private byte[] decrypt(byte[] data, int expectedCrc) {
+        private byte[] decrypt(byte[] data, int expectedCrc, byte[][] usedKey) {
             if (keys == null) {
                 return null;
             }
@@ -137,6 +140,7 @@ public final class Hj212Codecs {
                 try {
                     byte[] plain = Hj212Crypto.decrypt(data, key);
                     if (Checksums.crc16Hj212(plain) == expectedCrc) {
+                        usedKey[0] = key;
                         return plain;
                     }
                 } catch (RuntimeException ignored) {

@@ -71,8 +71,15 @@ public class Session {
         return (T) attributes.get(name);
     }
 
+    /**
+     * value 为 null 表示删掉这个属性
+     */
     public void setAttribute(String name, Object value) {
-        attributes.put(name, value);
+        if (value == null) {
+            attributes.remove(name);
+        } else {
+            attributes.put(name, value);
+        }
     }
 
     public String getDeviceId() {

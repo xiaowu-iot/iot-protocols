@@ -141,6 +141,8 @@ public class Hj212Server {
                 session.setAttribute(Hj212CommandSender.ATTR_PW, received.getPw());
             }
             session.setAttribute(Hj212CommandSender.ATTR_VERSION, received.version());
+            // 2025 版：设备用哪把密钥加密，平台下发要加密的命令就用哪把；设备改回明文了就不再加密
+            session.setAttribute(Hj212CommandSender.ATTR_KEY, received.isEncrypted() ? received.getCipherKey() : null);
             if (received.getSt() != null && !Hj212Packet.ST_SYSTEM.equals(received.getSt())) {
                 session.setAttribute(Hj212CommandSender.ATTR_ST, received.getSt());
             }

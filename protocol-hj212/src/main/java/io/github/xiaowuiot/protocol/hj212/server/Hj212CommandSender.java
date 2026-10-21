@@ -3,6 +3,7 @@ package io.github.xiaowuiot.protocol.hj212.server;
 import io.github.xiaowuiot.protocol.codec.session.Session;
 import io.github.xiaowuiot.protocol.codec.session.SessionManager;
 import io.github.xiaowuiot.protocol.hj212.Hj212Commands;
+import io.github.xiaowuiot.protocol.hj212.Hj212Crypto;
 import io.github.xiaowuiot.protocol.hj212.Hj212Packet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,6 +46,8 @@ public class Hj212CommandSender {
     public static final String ATTR_ST = "hj212.st";
     public static final String ATTR_PW = "hj212.pw";
     public static final String ATTR_VERSION = "hj212.version";
+    /** 2025 版设备加密用的密钥（最近一条加密报文解开时用的那把） */
+    public static final String ATTR_KEY = "hj212.key";
 
     public static final class Result {
         public final String qn;
@@ -85,6 +88,7 @@ public class Hj212CommandSender {
         final CompletableFuture<Result> future = new CompletableFuture<>();
         volatile boolean ready;
         volatile ScheduledFuture<?> retry;
+        volatile ScheduledFuture<?> total;
 
         Pending(Hj212Packet request) {
             this.request = request;
@@ -132,6 +136,11 @@ public class Hj212CommandSender {
         if (params != null) {
             params.forEach(p::putParam);
         }
+        byte[] cipherKey = session.getAttribute(ATTR_KEY);
+        if (cipherKey != null && version != null && version >= Hj212Packet.VERSION_2025 && Hj212Crypto.mustEncrypt(cn)) {
+            // 2025 版规定数据命令（2000~2999）、1014 更新密钥、3020 要加密 CP；1014 明文发出去等于把新密钥公开了
+            p.encryptWith(cipherKey);
+        }
         Pending pd = new Pending(p);
         String key = key(mn, p.getQn());
         pending.put(key, pd);
@@ -141,8 +150,12 @@ public class Hj212CommandSender {
             if (pd.retry != null) {
                 pd.retry.cancel(false);
             }
+            if (pd.total != null) {
+                pd.total.cancel(false);
+            }
         });
     }
+
 
     private void transmit(Session session, Pending pd, String key, int timeoutSeconds) {
         if (pd.future.isDone() || pd.ready) {
@@ -165,7 +178,7 @@ public class Hj212CommandSender {
                 overTimeSeconds, TimeUnit.SECONDS);
         if (pd.result.sendTimes == 1) {
             // 总超时：收到 9011 之后最多再等 timeoutSeconds 秒
-            session.getChannel().eventLoop().schedule(() -> pd.future.completeExceptionally(
+            pd.total = session.getChannel().eventLoop().schedule(() -> pd.future.completeExceptionally(
                     new TimeoutException("没有收到执行结果 9012")), (long) overTimeSeconds * (reCount + 1) + timeoutSeconds, TimeUnit.SECONDS);
         }
     }

@@ -255,6 +255,15 @@ public class Hj212Packet {
         return this;
     }
 
+    /**
+     * 收到的加密报文：记下是用哪把密钥解开的，平台回给这台设备的加密命令用同一把
+     */
+    public Hj212Packet markEncrypted(byte[] key) {
+        this.encrypted = true;
+        this.cipherKey = key;
+        return this;
+    }
+
     public byte[] getCipherKey() {
         return cipherKey;
     }
