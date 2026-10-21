@@ -220,6 +220,7 @@ flowchart TB
 
     HTTP -->|"⑤ HTTP-FLV"| PL["浏览器 mpegts.js 播放"]
     RTMP -->|"RTMP（可选）"| ZLM["ZLMediaKit / SRS / CDN<br/>再转 HLS、WebRTC、RTSP"]
+    ZLM -->|"FLV、HLS、RTSP、WebRTC"| X3["第三方播放器、其他系统、大量观众"]
     HUB -.-> IDLE["⑥ 没人看了（宽限期到）或等不到推流：<br/>StreamHub.onIdle → VideoService 通过 808 下发 0x9102 / 0x9202 关闭"]
 ```
 
