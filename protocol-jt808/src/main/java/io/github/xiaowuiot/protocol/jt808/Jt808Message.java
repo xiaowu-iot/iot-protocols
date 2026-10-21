@@ -15,19 +15,28 @@ public class Jt808Message {
      * 分包消息还没收齐时为 true，此时 body 为 null，只需要回一个通用应答
      */
     private final boolean fragment;
+    private final boolean malformed;
 
     public Jt808Message(Jt808Header header, Object body) {
-        this(header, body, false);
+        this(header, body, false, false);
     }
 
-    private Jt808Message(Jt808Header header, Object body, boolean fragment) {
+    private Jt808Message(Jt808Header header, Object body, boolean fragment, boolean malformed) {
         this.header = header;
         this.body = body;
         this.fragment = fragment;
+        this.malformed = malformed;
     }
 
     public static Jt808Message fragment(Jt808Header header) {
-        return new Jt808Message(header, null, true);
+        return new Jt808Message(header, null, true, false);
+    }
+
+    /**
+     * 消息头没问题、消息体和协议对不上（多半是厂家固件和文档不一致）。平台要回"消息有误"，否则终端会一直重发
+     */
+    public static Jt808Message malformed(Jt808Header header) {
+        return new Jt808Message(header, null, false, true);
     }
 
     public Jt808Header getHeader() {
@@ -47,8 +56,12 @@ public class Jt808Message {
         return fragment;
     }
 
+    public boolean isMalformed() {
+        return malformed;
+    }
+
     @Override
     public String toString() {
-        return header + (fragment ? " (分包未收齐)" : " " + body);
+        return header + (fragment ? " (分包未收齐)" : malformed ? " (消息体有误)" : " " + body);
     }
 }

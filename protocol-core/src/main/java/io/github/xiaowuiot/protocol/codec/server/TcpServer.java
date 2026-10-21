@@ -59,7 +59,7 @@ public class TcpServer {
                      Consumer<ChannelPipeline> pipelineConfigurer, Runnable beforeStop) {
         this.name = name;
         this.protocol = protocol;
-        this.rawRecorder = new RawMessageRecorder(protocol, 200, 20000);
+        this.rawRecorder = new RawMessageRecorder(protocol, 20, 20000);
         this.port = port;
         this.idleSeconds = idleSeconds;
         this.workerThreads = workerThreads;

@@ -22,7 +22,7 @@ public class Jt808Server {
         this.sessions = b.sessions != null ? b.sessions : new SessionManager();
         this.commandSender = new Jt808CommandSender(sessions);
         Jt808ServerHandler handler = new Jt808ServerHandler(sessions,
-                b.authService != null ? b.authService : new InMemoryAuthService(),
+                b.authService != null ? b.authService : defaultAuthService(),
                 commandSender,
                 b.listener != null ? b.listener : Jt808MessageListener.NOOP);
         this.server = new TcpServer("808 接入服务", Jt808CommandSender.PROTOCOL, b.port, b.idleSeconds, b.workerThreads,
@@ -32,6 +32,14 @@ public class Jt808Server {
                 },
                 () -> sessions.closeAll(Jt808CommandSender.PROTOCOL));
         this.server.setBindAddress(b.bindAddress);
+    }
+
+    /**
+     * 没传鉴权服务时用内存版：任何手机号注册都放行，只适合本地调试和测试，生产环境必须接自己的终端档案
+     */
+    private static Jt808AuthService defaultAuthService() {
+        org.slf4j.LoggerFactory.getLogger(Jt808Server.class).warn("没有配置 Jt808AuthService，使用 InMemoryAuthService：任何终端都能注册鉴权，只能用于调试和测试");
+        return new InMemoryAuthService();
     }
 
     public static Builder builder() {

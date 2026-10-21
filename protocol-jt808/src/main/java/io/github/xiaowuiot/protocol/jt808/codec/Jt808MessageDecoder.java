@@ -1,8 +1,10 @@
 package io.github.xiaowuiot.protocol.jt808.codec;
 
+import io.github.xiaowuiot.protocol.codec.session.Session;
 import io.github.xiaowuiot.protocol.codec.stats.CodecStats;
 import io.github.xiaowuiot.protocol.codec.util.Checksums;
 import io.github.xiaowuiot.protocol.codec.util.HexUtils;
+import io.github.xiaowuiot.protocol.codec.util.RateLimitedLog;
 import io.github.xiaowuiot.protocol.jt808.Jt808Header;
 import io.github.xiaowuiot.protocol.jt808.Jt808Message;
 import io.github.xiaowuiot.protocol.jt808.Jt808Version;
@@ -36,6 +38,9 @@ import java.util.concurrent.TimeUnit;
 public class Jt808MessageDecoder extends MessageToMessageDecoder<ByteBuf> {
 
     private static final Logger log = LoggerFactory.getLogger(Jt808MessageDecoder.class);
+    /** 坏帧可能是持续的（固件 bug、有人乱发），日志要限流，否则能刷满磁盘、拖慢 IO 线程 */
+    private static final RateLimitedLog DROP_LOG = new RateLimitedLog(log, 1000);
+    private static final RateLimitedLog BODY_LOG = new RateLimitedLog(log, 1000);
 
     /**
      * 最短的一帧：2013 版消息头 12 字节 + 校验码 1 字节
@@ -89,6 +94,12 @@ public class Jt808MessageDecoder extends MessageToMessageDecoder<ByteBuf> {
         ByteBuf body = frame.slice(frame.readerIndex(), bodyLength);
 
         if (header.isSubpackage()) {
+            if (ctx.channel().parent() != null && ctx.channel().attr(Session.KEY).get() == null) {
+                // 服务端接入的连接（有父 Channel）：注册、鉴权都不分包，没鉴权就发分包的不缓存，防止被拿来占内存。
+                // 终端、模拟器这一侧收平台下发的分包时没有会话，不受影响
+                drop(ctx, frame.readerIndex(start), "未鉴权的连接不接收分包");
+                return;
+            }
             ByteBuf merged;
             try {
                 merged = assembler.add(header, body, ctx.alloc());
@@ -127,14 +138,14 @@ public class Jt808MessageDecoder extends MessageToMessageDecoder<ByteBuf> {
         } catch (RuntimeException e) {
             // 消息体字段和协议不符，多半是厂家固件和文档不一致，原始报文一定要打出来
             CodecStats.increment("jt808.body");
-            log.warn("{} 消息体解析失败 {}，消息体：{}", ctx.channel(), header,
-                    HexUtils.toHex(body.readerIndex(bodyStart)), e);
+            BODY_LOG.warn("消息体解析失败", ctx.channel() + " " + header + "，消息体：" + HexUtils.toHex(body.readerIndex(bodyStart)), e);
+            out.add(Jt808Message.malformed(header));
         }
     }
 
     private static void drop(ChannelHandlerContext ctx, ByteBuf frame, String reason) {
         CodecStats.increment("jt808.drop");
-        log.warn("{} 丢弃一帧：{}，内容：{}", ctx.channel(), reason, HexUtils.toHex(frame));
+        DROP_LOG.warn("丢弃一帧", ctx.channel() + " " + reason + "，内容：" + HexUtils.toHex(frame), null);
     }
 
     @Override

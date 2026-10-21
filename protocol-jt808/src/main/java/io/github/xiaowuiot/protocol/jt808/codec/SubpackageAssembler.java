@@ -19,17 +19,31 @@ import java.util.Map;
  *     <li>某一包永远不来：每组分包都有超时时间，超时后整组丢弃，否则内存只增不减</li>
  *     <li>同一包重复到达（终端没收到应答而重发）：覆盖，不重复计数</li>
  *     <li>总包数是个离谱的大数：超过上限直接丢弃，防止恶意或错误数据撑爆内存</li>
+ *     <li>一条连接同时在拼的组数、缓存的总字节数都有上限：组数满了丢掉最久没动的那组，字节超了丢掉当前这组</li>
  * </ul>
  */
 public class SubpackageAssembler {
 
     private final long timeoutMillis;
     private final int maxPackets;
+    private final int maxGroups;
+    private final long maxBytes;
     private final Map<Integer, Group> groups = new HashMap<>();
+    private long bytes;
 
     public SubpackageAssembler(long timeoutMillis, int maxPackets) {
+        this(timeoutMillis, maxPackets, 4, 8L * 1024 * 1024);
+    }
+
+    /**
+     * @param maxGroups 一条连接同时在拼的消息数（按消息 ID 分组）
+     * @param maxBytes  一条连接缓存的分包总字节数
+     */
+    public SubpackageAssembler(long timeoutMillis, int maxPackets, int maxGroups, long maxBytes) {
         this.timeoutMillis = timeoutMillis;
         this.maxPackets = maxPackets;
+        this.maxGroups = maxGroups;
+        this.maxBytes = maxBytes;
     }
 
     /**
@@ -50,23 +64,33 @@ public class SubpackageAssembler {
         Group g = groups.get(header.getMsgId());
         if (g == null || g.parts.length != total) {
             if (g != null) {
-                g.release();
+                drop(header.getMsgId());
+            } else if (groups.size() >= maxGroups) {
+                dropOldest();
             }
             g = new Group(total, now);
             groups.put(header.getMsgId(), g);
         }
-        if (g.parts[no - 1] == null) {
+        ByteBuf old = g.parts[no - 1];
+        long after = bytes + body.readableBytes() - (old == null ? 0 : old.readableBytes());
+        if (after > maxBytes) {
+            drop(header.getMsgId());
+            throw new IllegalArgumentException("缓存的分包超过 " + maxBytes + " 字节，丢弃 " + String.format("0x%04X", header.getMsgId()) + " 已收到的分包");
+        }
+        if (old == null) {
             g.received++;
         } else {
-            g.parts[no - 1].release();
+            old.release();
         }
         g.parts[no - 1] = body.retain();
+        bytes = after;
         g.lastTime = now;
 
         if (g.received < total) {
             return null;
         }
         groups.remove(header.getMsgId());
+        bytes -= g.size();
         CompositeByteBuf merged = alloc.compositeBuffer(total);
         for (ByteBuf part : g.parts) {
             merged.addComponent(true, part);
@@ -86,6 +110,7 @@ public class SubpackageAssembler {
             g.release();
         }
         groups.clear();
+        bytes = 0;
     }
 
     private void expire(long now) {
@@ -93,10 +118,38 @@ public class SubpackageAssembler {
         while (it.hasNext()) {
             Group g = it.next();
             if (now - g.lastTime > timeoutMillis) {
+                bytes -= g.size();
                 g.release();
                 it.remove();
             }
         }
+    }
+
+    private void drop(int msgId) {
+        Group g = groups.remove(msgId);
+        if (g != null) {
+            bytes -= g.size();
+            g.release();
+        }
+    }
+
+    private void dropOldest() {
+        Integer oldest = null;
+        long t = Long.MAX_VALUE;
+        for (Map.Entry<Integer, Group> e : groups.entrySet()) {
+            if (e.getValue().lastTime < t) {
+                t = e.getValue().lastTime;
+                oldest = e.getKey();
+            }
+        }
+        if (oldest != null) {
+            drop(oldest);
+        }
+    }
+
+    /** 缓存的字节数，监控用 */
+    public long pendingBytes() {
+        return bytes;
     }
 
     private static final class Group {
@@ -107,6 +160,16 @@ public class SubpackageAssembler {
         Group(int total, long now) {
             parts = new ByteBuf[total];
             lastTime = now;
+        }
+
+        long size() {
+            long n = 0;
+            for (ByteBuf p : parts) {
+                if (p != null) {
+                    n += p.readableBytes();
+                }
+            }
+            return n;
         }
 
         void release() {

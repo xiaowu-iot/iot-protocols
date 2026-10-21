@@ -49,21 +49,30 @@ public class RawMessageRecorder extends ChannelDuplexHandler {
     private static final int MAX_PENDING = 20;
 
     /**
-     * 单条记录最多保存多少字节
+     * 单条记录最多保存多少字节（多媒体、升级包这类大块数据只留开头，够看清是什么消息）
      */
-    private static final int MAX_BYTES = 2048;
+    private static final int MAX_BYTES = 512;
 
     public static final class Record {
         public final long time;
         public final String direction;
         public final String remote;
-        public final String hex;
+        /** 原始字节：存 byte[] 比存十六进制字符串省一半以上内存，查询时才转 */
+        public final byte[] data;
+        /** 超过 {@link #MAX_BYTES} 被截断了 */
+        public final boolean truncated;
 
-        Record(long time, String direction, String remote, String hex) {
+        Record(long time, String direction, String remote, byte[] data, boolean truncated) {
             this.time = time;
             this.direction = direction;
             this.remote = remote;
-            this.hex = hex;
+            this.data = data;
+            this.truncated = truncated;
+        }
+
+        /** 十六进制，截断的末尾带 "..." */
+        public String hex() {
+            return HexUtils.toHex(data) + (truncated ? "..." : "");
         }
     }
 
@@ -104,9 +113,10 @@ public class RawMessageRecorder extends ChannelDuplexHandler {
     }
 
     private void record(Channel ch, String direction, ByteBuf buf) {
-        String hex = buf.readableBytes() <= MAX_BYTES ? HexUtils.toHex(buf)
-                : HexUtils.toHex(buf.slice(buf.readerIndex(), MAX_BYTES)) + "...";
-        Record r = new Record(System.currentTimeMillis(), direction, String.valueOf(ch.remoteAddress()), hex);
+        int n = Math.min(buf.readableBytes(), MAX_BYTES);
+        byte[] data = new byte[n];
+        buf.getBytes(buf.readerIndex(), data);
+        Record r = new Record(System.currentTimeMillis(), direction, String.valueOf(ch.remoteAddress()), data, buf.readableBytes() > MAX_BYTES);
         Session session = ch.attr(Session.KEY).get();
         if (session == null) {
             // 还不知道是哪台设备，先存在连接上
@@ -120,7 +130,7 @@ public class RawMessageRecorder extends ChannelDuplexHandler {
             }
             pending.addLast(r);
             if (rawLog.isDebugEnabled()) {
-                rawLog.debug("{} {} {} {} {}", protocol, "-", direction, r.remote, hex);
+                rawLog.debug("{} {} {} {} {}", protocol, "-", direction, r.remote, r.hex());
             }
             return;
         }
@@ -136,7 +146,7 @@ public class RawMessageRecorder extends ChannelDuplexHandler {
             add(ring, r);
         }
         if (traced.contains(deviceId) || rawLog.isDebugEnabled()) {
-            rawLog.info("{} {} {} {} {}", protocol, deviceId, direction, r.remote, hex);
+            rawLog.info("{} {} {} {} {}", protocol, deviceId, direction, r.remote, r.hex());
         }
     }
 

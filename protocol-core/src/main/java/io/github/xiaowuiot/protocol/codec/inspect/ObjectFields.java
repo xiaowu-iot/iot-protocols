@@ -87,7 +87,8 @@ public final class ObjectFields {
         if (o instanceof Boolean) {
             return (Boolean) o ? "是" : "否";
         }
-        return String.valueOf(o).replace('T', ' ');
+        // 只有时间要把 2026-10-21T08:30 里的 T 换成空格，字符串里的 T（终端型号、车牌）要原样保留
+        return o instanceof Temporal ? o.toString().replace('T', ' ') : String.valueOf(o);
     }
 
     private static String hex(byte[] b, int max) {

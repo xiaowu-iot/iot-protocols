@@ -34,6 +34,15 @@ public class SessionManager {
      * 设备鉴权成功后调用。
      */
     public Session register(String deviceId, String protocol, Channel channel) {
+        Session current = channel.attr(Session.KEY).get();
+        if (current != null) {
+            if (current.getDeviceId().equals(deviceId) && sessions.get(deviceId) == current) {
+                // 同一台设备在同一条连接上重复鉴权：沿用原来的会话，流水号和补传缓存都不能丢
+                return current;
+            }
+            // 同一条连接换了设备号：原来那台先下线，不能留在表里，否则真设备上线时会误关这条连接
+            unregister(channel);
+        }
         Session session = new Session(deviceId, protocol, channel);
         channel.attr(Session.KEY).set(session);
         Session old = sessions.put(deviceId, session);

@@ -46,16 +46,18 @@ public class PendingRequests<R> {
     public CompletableFuture<R> register(String deviceId, int serialNo, long timeout, TimeUnit unit) {
         String key = key(deviceId, serialNo);
         Pending<R> p = new Pending<>();
-        Pending<R> old = pending.put(key, p);
-        if (old != null) {
-            // 流水号回绕了一圈还没等到应答，旧的那条肯定已经超时了
-            old.future.completeExceptionally(new IllegalStateException("流水号被复用：" + key));
-        }
+        // 先建好超时任务再登记：登记之后应答随时可能到，complete 里要能直接取消它
         p.timeout = timer.newTimeout(t -> {
             if (pending.remove(key, p)) {
                 p.future.completeExceptionally(new TimeoutException("等待应答超时：" + key));
             }
         }, timeout, unit);
+        Pending<R> old = pending.put(key, p);
+        if (old != null) {
+            // 流水号回绕了一圈还没等到应答，旧的那条肯定已经超时了
+            old.timeout.cancel();
+            old.future.completeExceptionally(new IllegalStateException("流水号被复用：" + key));
+        }
         return p.future;
     }
 
@@ -94,6 +96,6 @@ public class PendingRequests<R> {
 
     private static final class Pending<R> {
         final CompletableFuture<R> future = new CompletableFuture<>();
-        volatile Timeout timeout;
+        Timeout timeout;
     }
 }

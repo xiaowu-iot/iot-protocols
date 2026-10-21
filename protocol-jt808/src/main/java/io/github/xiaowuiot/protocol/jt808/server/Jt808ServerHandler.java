@@ -76,6 +76,11 @@ public class Jt808ServerHandler extends SimpleChannelInboundHandler<Jt808Message
             reply(ctx, header, GeneralResponse.SUCCESS);
             return;
         }
+        if (msg.isMalformed()) {
+            // 消息体和协议对不上：回"消息有误"，终端就不会一直重发，等应答的指令也能马上知道结果
+            reply(ctx, header, GeneralResponse.MESSAGE_ERROR);
+            return;
+        }
         switch (header.getMsgId()) {
             case MessageId.REGISTER:
                 onRegister(ctx, header, msg.<Register>getBody());
@@ -205,6 +210,10 @@ public class Jt808ServerHandler extends SimpleChannelInboundHandler<Jt808Message
         } catch (RuntimeException e) {
             // 业务代码的 bug（比如类型转换错误）不能让设备掉线：当作处理失败，不回应答
             FAILURE_LOG.warn("业务处理抛出异常，不回应答", session + " " + header, e);
+            return;
+        }
+        if (result == null) {
+            FAILURE_LOG.warn("业务处理返回了 null，按处理失败对待，不回应答", session + " " + header, null);
             return;
         }
         result.whenComplete((v, e) -> {
