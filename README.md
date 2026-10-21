@@ -55,6 +55,343 @@ JDK 8 以上都能构建，产物在 JDK 8 上运行。
 
 0.x 版本接口可能还会调整，1.0 之后保持兼容。
 
+## 工作流程
+
+下面是各协议在这个库里的处理流程，类名、方法名和代码一致。图用 Mermaid 写，GitHub 上直接显示成图。
+
+### 1. 总体分层
+
+所有协议共用同一套底座：一条 TCP 连接进来，先经过底座的公共环节，再进各协议自己的切帧、解码和业务处理；平台下发指令走反方向，用"流水号 / 应答匹配"把异步的应答对回到调用方。
+
+```mermaid
+flowchart TB
+    D["设备 / 终端 / 下级平台"]
+
+    subgraph UP["上行：设备 → 平台"]
+        direction TB
+        S["TcpServer（epoll / NIO）"] --> I["IdleStateHandler：读空闲判离线"]
+        I --> ST["IoStats：连接数、流量"]
+        ST --> RAW["RawMessageRecorder：原始报文，每台最近 20 条"]
+        RAW --> F["协议切帧：转义帧 / 长度帧 / ASCII 帧"]
+        F --> M["消息解码：校验、消息头、消息体"]
+        M --> H["协议服务 Handler：注册鉴权、应答、会话"]
+        H --> L["Listener：交给平台 / 网关"]
+    end
+
+    subgraph DOWN["下行：平台 → 设备"]
+        direction TB
+        CS["CommandSender.send"] --> PR["PendingRequests：按 设备号+流水号 先登记，带超时"]
+        PR --> E["消息编码、转义、加校验"]
+        E --> W["写出"]
+        R["设备应答"] --> PR2["按流水号 / 消息类型对回"]
+        PR2 --> OK["CompletableFuture 完成（或超时失败）"]
+    end
+
+    D -->|TCP 字节流| S
+    W --> D
+    H -->|是应答| R
+    H --> SM["SessionManager：设备号 → 连接"]
+```
+
+底座的几条通用规则：
+
+- **坏数据不断连接**：校验错、长度不对的帧丢掉并计数（`CodecStats`），日志限流，连接保留。
+- **半包粘包**：切帧器只认完整的帧，不完整的留在缓冲区里等下一次读；帧长有上限，超长直接丢。
+- **会话**：鉴权（或第一条合法数据）之后才有会话；同一设备号在新连接上线时关闭旧连接；同一连接换了设备号，旧的先下线。
+- **应答匹配**：下发时先登记再发送，应答按"设备号 + 流水号"（或按消息类型）对回；超时、发送失败都会让调用方立刻拿到结果。
+
+### 2. JT/T 808
+
+#### 2.1 终端接入时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as 终端
+    participant H as Jt808ServerHandler
+    participant A as Jt808AuthService
+    participant SM as SessionManager
+    participant L as Listener（平台）
+
+    T->>H: TCP 连接
+    Note over H: sessions.connected 发出"连接"事件
+    T->>H: 0x0100 终端注册
+    H->>A: register（车牌、厂商、终端 ID）
+    A-->>H: 结果 + 鉴权码
+    H-->>T: 0x8100 注册应答（带鉴权码）
+    T->>H: 0x0102 终端鉴权
+    H->>A: authenticate
+    alt 鉴权码正确
+        H->>SM: register（设备号 → 连接，旧连接被踢下线）
+        H-->>T: 0x8001 通用应答 成功
+    else 鉴权码不对
+        H-->>T: 0x8001 通用应答 失败
+    end
+    loop 心跳间隔
+        T->>H: 0x0002 心跳
+        H-->>T: 0x8001
+    end
+    T->>H: 0x0200 位置汇报
+    H->>L: onMessage
+    L-->>H: 处理完成（CompletionStage）
+    H-->>T: 0x8001 成功（处理失败不回，终端会重发）
+    Note over T,H: 读空闲超过 3 个心跳周期：判定离线，关闭连接，发"断开"事件（原因：心跳超时）
+```
+
+#### 2.2 上行解码流水线
+
+```mermaid
+flowchart TD
+    A["TCP 字节流"] --> B["EscapedDelimiterFrameDecoder<br/>按 7E 切帧，7D 02→7E、7D 01→7D 反转义"]
+    B -->|超长 / 转义非法| X1["丢弃并计数"]
+    B --> C["Jt808MessageDecoder：BCC 校验"]
+    C -->|校验失败| X1
+    C --> D["读消息头"]
+    D --> E{"消息体属性 bit14<br/>是 2019 版？"}
+    E -->|是| V19["按 2019 版：协议版本号 + 10 字节手机号"]
+    E -->|否| V13{"这条连接<br/>记过 2011 版？"}
+    V13 -->|是| V11["按 2011 版"]
+    V13 -->|否| V1["按 2013 版"]
+    V19 --> F["消息体长度和属性一致？"]
+    V11 --> F
+    V1 --> F
+    F -->|否| X1
+    F --> G{"分包？"}
+    G -->|否| J["BodyDecoders 按消息 ID 解消息体"]
+    G -->|是，连接还没鉴权| X1
+    G -->|是| SA["SubpackageAssembler<br/>每连接最多 4 组、8MB，60 秒过期"]
+    SA -->|没收齐| FR["分包标记 → 每一包回 0x8001"]
+    SA -->|收齐| J
+    J -->|成功| K["Jt808Message → Handler"]
+    J -->|字段和协议不符| MAL["消息有误标记 → 回 0x8001 结果 2"]
+```
+
+版本识别补充：2011 和 2013 版的消息头完全一样，只能靠注册消息 0x0100 的长度区分（2011 版的制造商 ID、终端型号更短）。认出 2011 版后记在连接上，之后这条连接的消息都按 2011 版解；终端重连后直接鉴权的，按注册时记在档案里的版本处理。
+
+#### 2.3 平台下发指令
+
+```mermaid
+flowchart TD
+    A["业务调用 Jt808CommandSender.send<br/>（设备号、消息 ID、消息体、超时）"] --> B{"设备在线？"}
+    B -->|否| X["立刻失败：DeviceOfflineException"]
+    B -->|是| C["会话分配流水号"]
+    C --> D["PendingRequests.register<br/>先登记再发送"]
+    D --> E{"消息体超过 1023 字节？"}
+    E -->|否| F["编码一帧 → 转义 → 发送"]
+    E -->|是| G["sendLarge：自动分包<br/>每包缓存，供终端补传"]
+    F --> W{"等应答"}
+    G --> W
+    W -->|0x0001 通用应答<br/>按应答流水号匹配| OK["future 完成：结果码"]
+    W -->|0x0104 / 0x0201 / 0x0107 等<br/>按消息类型匹配| OK
+    W -->|超时| TO["future 失败：TimeoutException"]
+    G -. 终端发 0x0005 补传请求 .-> R["按包序号重发缺的分包"]
+```
+
+### 3. JT/T 1078 音视频
+
+#### 3.1 组件
+
+信令走 808 的连接，音视频走单独的媒体端口，两条路在平台的 `VideoService` 汇合。
+
+```mermaid
+flowchart TB
+    UI["① 浏览器：点播放"] -->|"POST /api/video/play"| VS["② 平台 VideoService<br/>流标识、播放令牌、登记期待推流"]
+    VS -->|"③ 0x9101 实时 / 0x9201 回放（走 808 连接）"| T["终端"]
+    T -->|"④ RTP 码流（实时 7615 / 回放 7616）"| PD
+
+    subgraph MEDIA["媒体服务 MediaServer"]
+        direction TB
+        PD["Jt1078PacketDecoder<br/>找帧头 30 31 63 64，识别 SIM 卡号 6 / 10 字节"] --> IH["IngestHandler<br/>推流鉴权，登记推流者"]
+        IH --> FA["FrameAssembler<br/>分包重组成帧（视频、音频分开拼）"]
+        FA --> MS["MediaStream<br/>拆 NAL、序列头、封装 FLV、GOP 缓存、分发"]
+        MS --> HTTP["HttpFlvHandler（7617）<br/>校验播放令牌，chunked 输出 FLV"]
+        IH -.->|"publish / unpublish"| HUB["StreamHub<br/>谁在推、谁在看、引用计数<br/>宽限期 30 秒、等推流 20 秒"]
+        HTTP -.->|"subscribe / unsubscribe"| HUB
+    end
+
+    HTTP -->|"⑤ HTTP-FLV"| PL["浏览器 mpegts.js 播放"]
+    HUB -.-> IDLE["⑥ 没人看了（宽限期到）或等不到推流：<br/>StreamHub.onIdle → VideoService 通过 808 下发 0x9102 / 0x9202 关闭"]
+```
+
+#### 3.2 实时视频时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as 浏览器
+    participant VS as 平台 VideoService
+    participant T as 终端
+    participant MS as 媒体服务
+    participant HUB as StreamHub
+
+    B->>VS: 点播放（车辆、通道、主/子码流）
+    VS->>VS: key = 手机号去前导 0 + "_" + 通道号，签发（或复用）播放令牌
+    alt 这路流已经在推
+        VS-->>B: 播放地址（alreadyStreaming）
+    else 没在推
+        VS->>VS: 登记"期待推流"（2 分钟内有效）
+        VS->>T: 0x9101 实时音视频请求（媒体服务地址、端口、通道、码流）
+        T-->>VS: 0x0001 通用应答
+        VS-->>B: 播放地址 /live/{key}.flv?token
+    end
+    B->>MS: GET 播放地址
+    MS->>VS: allowPlay（令牌、key、有效期）
+    MS->>HUB: subscribe（取消空闲计时，没推流就记下开始等的时间）
+    MS-->>B: FLV 文件头（有序列头和 GOP 就马上补发：秒开）
+    T->>MS: 连接媒体端口，推 RTP 包
+    MS->>VS: allowPublish（期待推流，或者有人在等的断线重连）
+    MS->>HUB: publish（登记推流者，旧推流连接被踢掉）
+    loop 每个 RTP 包
+        MS->>MS: 重组成帧 → FLV tag → 发给每个观看者
+    end
+    MS-->>B: FLV 视频 tag（慢的观看者跳到下一个关键帧）
+    B->>MS: 关闭页面（连接断开）
+    MS->>HUB: unsubscribe，观看人数变成 0
+    Note over HUB: 宽限期 30 秒内有人再来就继续看
+    HUB->>HUB: 30 秒后仍没人看：从登记处删除这路流
+    HUB->>VS: onIdle
+    VS->>T: 0x9102 关闭音视频传输
+    Note over MS: 终端还在推的数据会被丢弃，推流连接被断开
+```
+
+#### 3.3 一路流的生命周期
+
+```mermaid
+stateDiagram-v2
+    state "等终端推流" as Waiting
+    state "推流中、有人看" as Playing
+    state "推流中、没人看（宽限期）" as NoViewer
+    state "推流断开、有人在等" as Reconnect
+    state "关闭" as Closed
+
+    [*] --> Waiting: 浏览器先来（subscribe）
+    [*] --> NoViewer: 终端先推上来（publish，没人看）
+    Waiting --> Playing: 终端推流（publish）
+    Waiting --> Closed: 等了 20 秒没推上来（sweep，触发 onIdle）
+    Playing --> NoViewer: 最后一个观看者离开
+    NoViewer --> Playing: 宽限期内有人再来
+    NoViewer --> Closed: 宽限期 30 秒到（onIdle → 0x9102）
+    Playing --> Reconnect: 推流连接断开
+    Reconnect --> Playing: 终端重连推流（允许，不用重发 0x9101）
+    Reconnect --> Closed: 20 秒没重连上
+    Playing --> Closed: 回放放完（_pb 流推流断开）
+    Closed --> [*]
+```
+
+#### 3.4 一帧的处理（MediaStream.onFrame）
+
+```mermaid
+flowchart TD
+    A["FrameAssembler 交出一帧"] --> B{"视频？"}
+    B -->|音频 / 透传| X["暂不分发"]
+    B -->|视频| C["H264.split：按起始码拆 NAL"]
+    C --> D["FlvMuxer.sort：分拣 SPS / PPS / VPS 和图像 NAL"]
+    D --> E["时间戳：减去首帧时间；倒退或跳变超过 10 秒按上一帧 +40ms 续上"]
+    E --> F{"SPS / PPS 变了？<br/>（H.265 还要有 VPS）"}
+    F -->|是| G["重建序列头（AVC / HEVC），发给所有观看者"]
+    F -->|否| H
+    G --> H["封装 FLV 视频 tag"]
+    H --> I{"关键帧？"}
+    I -->|是| J["清空 GOP 缓存，从这一帧开始重新缓存"]
+    I -->|否| K["追加到 GOP（超过 300 帧或 16MB 整组清空）"]
+    J --> L["分发：每个观看者一份引用（retainedDuplicate，不拷贝）"]
+    K --> L
+    L --> M{"观看者写缓冲超过高水位？"}
+    M -->|是| N["这个观看者跳过后面的帧，等下一个关键帧"]
+    M -->|否| O["写出"]
+```
+
+#### 3.5 录像回放的不同之处
+
+- 先用 0x9205 查终端里的录像，终端用 0x1205 回资源列表（可能分包）。
+- 回放下发 0x9201（推到回放端口 7616），流标识后面加 `_pb`，和同一通道的实时视频分开。
+- 每次点回放都重新下发 0x9201；同一个 `_pb` 有新的推流连接时，旧的被踢掉。
+- 终端放完这段录像会断开推流连接，平台随即结束这路流；没人看时下发 0x9202 停止回放。
+
+### 4. HJ 212 污染物在线监测
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as 数采仪（现场机）
+    participant S as Hj212Server
+    participant C as Hj212CommandSender
+    participant L as 平台
+
+    D->>S: TCP 连接（没有登录步骤）
+    D->>S: 2011 实时数据（## + 4 位长度 + 数据段 + CRC）
+    Note over S: CRC 不对时按 MN 查密钥，SM4 解开 CP 后重新校验（2025 版加密报文）
+    S->>S: 校验 PW，第一条合法数据时上线，记下 PW、ST、版本、密钥
+    S->>L: onPacket
+    S-->>D: 9014 数据应答（Flag 要求应答时，按设备的版本回）
+    D->>S: 9015 心跳（2025 版）
+    S-->>D: 9013
+    L->>C: 下发命令（比如 2061 提取小时数据）
+    C->>D: 2061（QN 严格递增，Flag 要求应答，2025 版加密 CP）
+    alt overTime 秒没收到 9011
+        C->>D: 原样重发（QN 不变），最多 reCount 次
+    end
+    D-->>C: 9011 请求应答（QnRtn=1 准备执行）
+    D-->>C: 2061 数据（2017 版同一个 QN，2025 版每包新 QN）
+    C-->>D: 9014（2025 版每包都回）
+    D-->>C: 9012 执行结果（ExeRtn=1 成功）
+    C->>L: 结果 + 收到的数据
+```
+
+- 分包：2017 版按 MN / QN / CN 组包，PNUM 有上限，每台设备同时最多 8 组；2025 版逐包交出。每一包都回 9014。
+- 2025 版加密：数据命令（2000~2999）、1014 更新密钥、3020 的 CP 用 SM4 加密，长度和 CRC 按明文算。
+- 校时：现场机发 1013 请求校时，平台回 9013 后下发 1012，重发 1012 时换成当前时间。
+
+### 5. SLP 智能储物柜 + 固件升级
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as 储物柜
+    participant S as SlpServer
+    participant F as ChunkProvider
+    participant L as 平台
+
+    D->>S: 0x01 登录（设备 ID、固件版本、格口数）
+    S-->>D: 0x81 登录应答（结果、平台时间、心跳间隔）
+    loop 心跳间隔
+        D->>S: 0x02 心跳
+        S-->>D: 0x82
+    end
+    D->>S: 0x03 格口状态
+    S->>L: onMessage
+    S-->>D: 0x83 结果
+    L->>S: 0x20 升级通知（版本、大小、CRC32）
+    S->>D: 0x20
+    D-->>S: 0xA0 应答
+    loop 设备要哪片给哪片（断点续传的状态在设备上）
+        D->>S: 0x21 分片请求（版本、偏移、长度）
+        S->>F: chunk（默认没有固件：回"版本不存在"）
+        S-->>D: 0xA1 分片
+        S->>L: 升级进度
+    end
+    D->>S: 0x22 升级结果
+    S->>L: onMessage
+    S-->>D: 0xA2
+```
+
+帧格式：`AA 55 | 版本 | 命令 | 流水号 | 设备 ID 8 | 长度 | 数据 | CRC16`，详见 [PROTOCOL.md](protocol-slp/PROTOCOL.md)。升级分片从 `SlpServer.ChunkProvider` 取，接自己的固件仓库实现这个接口就行。
+
+### 6. 报文解析器（协议中心）
+
+每个协议模块都有一个 `ProtocolInspector`，在 `META-INF/services` 登记。平台的"协议中心"用它解析和构造报文。
+
+```mermaid
+flowchart LR
+    A["粘贴的十六进制<br/>（空格、换行、0x、抓包偏移列都可以）"] --> B["ProtocolInspectors.parseHex"]
+    B --> C["detect：每个解析器打分 0~100"]
+    C --> D["选分数最高的（或用户指定的）解析器"]
+    D --> E["inspect：切帧、反转义、校验"]
+    E --> F["FieldReader 边读边记字节位置"]
+    F --> G["字段树：名称、位置、十六进制、解释后的值、问题"]
+    H["模板 + 表单输入"] --> I["build：组包、转义、算校验"] --> E
+```
+
 ## 许可证
 
 [Apache License 2.0](LICENSE)
