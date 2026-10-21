@@ -6,7 +6,7 @@
 |---|---|---|
 | `protocol-core` | — | 底座：转义帧 / 长度帧 / ASCII 帧切帧，半包、粘包、垃圾数据处理，会话管理，指令应答匹配，TCP 服务，收发统计和原始报文记录；**与协议无关的报文解析器接口** |
 | `protocol-jt808` | JT/T 808-2011 / 2013 / 2019 | 消息头、分包合包、全部标准消息的编解码，位置附加信息，终端接入服务 |
-| `protocol-jt1078` | JT/T 1078-2016 | 音视频信令；码流解包（SIM 卡号 6 / 10 字节自动识别）、帧重组、HTTP-FLV 转封装、声音分发、RTMP 转推 |
+| `protocol-jt1078` | JT/T 1078-2016 | 音视频信令；码流解包（SIM 卡号 6 / 10 字节自动识别）、帧重组、HTTP-FLV 转封装、声音分发、RTMP 转推、双向对讲 |
 | `protocol-hj212` | HJ 212-2005 / 2017 / 2025 | 实时和历史数据、反控命令、CRC；2025 版 Flag 识别、SM4 解密、心跳 |
 | `protocol-slp` | SLP（示例） | 一个虚构的智能储物柜私有协议，演示怎样从零设计私有二进制协议，见 [PROTOCOL.md](protocol-slp/PROTOCOL.md) |
 
@@ -358,6 +358,36 @@ sequenceDiagram
 - 转推跟着平台的按需拉流走：平台里有人看、终端在推才会转推；转推本身不让流一直开着
 - 对端收得慢时丢帧到下一个关键帧，不影响平台自己的观看者
 - 已和 ZLMediaKit（2026-10 master 版）联调：识别为 H.264 + PCMA，FLV、HLS 都能拉到，对端重启后几秒内自动重连。网页里的 FLV / HLS 播放器不认 G.711，播放 ZLMediaKit 的 FLV 时要设 `hasAudio: false`，要声音走 WebRTC；也可以 `RtmpRelay.setAudio(false)` 只推画面
+
+#### 3.7 双向对讲
+
+平台下发 0x9101（数据类型 2 双向对讲，通道一般是 36），终端用这个通道推声音上来；平台的声音从**同一条推流连接**发回终端。浏览器用 WebSocket 连 `/talk/{流}?token=…`。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as 浏览器
+    participant P as 平台 VideoService
+    participant T as 终端
+    participant M as 媒体服务（TalkSession）
+
+    B->>P: 开始对讲（车辆）
+    P->>T: 0x9101 数据类型 2（对讲通道）
+    P-->>B: 对讲地址 /talk/{流}?token
+    B->>M: WebSocket 握手（校验令牌）
+    T->>M: 连上推流端口，推 G.711 / ADPCM / AAC 声音
+    loop 通话中
+        B->>M: 麦克风 PCM（16 位 8000 Hz，回声消除）
+        M->>T: 每 40 毫秒一个 1078 音频包（G.711A，默认带海思头）
+        T->>M: 车上的声音
+        M-->>B: 解码后的 PCM（和监听同一套分块格式）
+    end
+    B->>M: 关闭 WebSocket
+    Note over M,P: 对讲算一个观看者；没人了等 30 秒，平台下发 0x9102 控制指令 4（关闭对讲）
+```
+
+- `MediaServer.sendAudio(流, G.711A)`：往终端发声音；`setTalkHisiHeader(false)` 去掉海思头（终端播出来是杂音时试试）
+- 浏览器只在 https（或 localhost）下允许使用麦克风
 
 ### 4. HJ 212 污染物在线监测
 

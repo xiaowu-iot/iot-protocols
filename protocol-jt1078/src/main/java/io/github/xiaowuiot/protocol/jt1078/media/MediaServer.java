@@ -29,6 +29,8 @@ import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.QueryStringDecoder;
+import io.netty.handler.codec.http.websocketx.WebSocketServerHandshaker;
+import io.netty.handler.codec.http.websocketx.WebSocketServerHandshakerFactory;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
 import org.slf4j.Logger;
@@ -39,6 +41,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
@@ -61,6 +64,7 @@ public class MediaServer {
 
     private static final Logger log = LoggerFactory.getLogger(MediaServer.class);
     private static final Pattern PATH = Pattern.compile(".*/live/([0-9A-Za-z_]+)\\.(flv|audio)$");
+    private static final Pattern TALK = Pattern.compile(".*/talk/([0-9A-Za-z_]+)$");
 
     private final StreamHub hub;
     private final String bindAddress;
@@ -75,6 +79,24 @@ public class MediaServer {
     private Channel liveChannel;
     private Channel playbackChannel;
     private Channel httpChannel;
+    /** 每路流的终端推流连接：对讲时平台的声音从这条连接发回给终端 */
+    private final Map<String, Uplink> uplinks = new ConcurrentHashMap<>();
+    private volatile boolean talkHisiHeader = true;
+
+    private static final class Uplink {
+        final Channel channel;
+        final String sim;
+        final int simLength;
+        final int logicalChannel;
+        int seq;
+
+        Uplink(Channel channel, String sim, int simLength, int logicalChannel) {
+            this.channel = channel;
+            this.sim = sim;
+            this.simLength = simLength;
+            this.logicalChannel = logicalChannel;
+        }
+    }
 
     /**
      * @param simLength SIM 卡号字节数：6、10，0 表示自动识别
@@ -145,6 +167,42 @@ public class MediaServer {
         return bytesOut.get();
     }
 
+    /**
+     * 对讲下行：平台的声音发给终端（G.711A，一帧 40 毫秒）。终端还没连上来时返回 false
+     */
+    public boolean sendAudio(String key, byte[] g711a) {
+        Uplink u = uplinks.get(key);
+        if (u == null || !u.channel.isActive() || !u.channel.isWritable()) {
+            return false;
+        }
+        byte[] body = g711a;
+        if (talkHisiHeader) {
+            // 海思头：00 01 长度/2 00，多数终端（海思方案）要求带
+            body = new byte[4 + g711a.length];
+            body[1] = 1;
+            body[2] = (byte) (g711a.length / 2);
+            System.arraycopy(g711a, 0, body, 4, g711a.length);
+        }
+        int seq;
+        synchronized (u) {
+            seq = u.seq++ & 0xFFFF;
+        }
+        Jt1078Packet p = new Jt1078Packet(Jt1078Packet.PT_G711A, true, seq, u.sim, u.logicalChannel, Jt1078Packet.TYPE_AUDIO,
+                Jt1078Packet.ATOMIC, System.currentTimeMillis(), 0, 0, body);
+        ByteBuf buf = u.channel.alloc().buffer(30 + body.length);
+        p.encode(buf, u.simLength);
+        bytesOut.addAndGet(buf.readableBytes());
+        u.channel.writeAndFlush(buf, u.channel.voidPromise());
+        return true;
+    }
+
+    /**
+     * 对讲下行的声音带不带海思头（默认带）。终端播放出来是杂音时，试试关掉
+     */
+    public void setTalkHisiHeader(boolean on) {
+        this.talkHisiHeader = on;
+    }
+
     // ==================== 收流 ====================
 
     /**
@@ -183,6 +241,7 @@ public class MediaServer {
                 Channel ch = ctx.channel();
                 s = hub.publish(key, ch, ch::close);
                 streams.put(key, s);
+                uplinks.put(key, new Uplink(ch, p.sim, p.sim.length() / 2, p.channel));
                 assemblers.put(key, new FrameAssembler());
                 log.info("{} 推流 {}（{}）", ctx.channel().remoteAddress(), key, Jt1078Packet.payloadName(p.payloadType));
             } else if (s.isClosed()) {
@@ -201,6 +260,7 @@ public class MediaServer {
         public void channelInactive(ChannelHandlerContext ctx) {
             Channel ch = ctx.channel();
             streams.keySet().forEach(k -> hub.unpublish(k, ch));
+            uplinks.values().removeIf(u -> u.channel == ch);
             streams.clear();
         }
 
@@ -230,6 +290,11 @@ public class MediaServer {
         protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
             channel = ctx.channel();
             QueryStringDecoder qs = new QueryStringDecoder(req.uri());
+            Matcher tm = TALK.matcher(qs.path());
+            if (tm.matches()) {
+                talk(ctx, req, qs, tm.group(1));
+                return;
+            }
             Matcher m = PATH.matcher(qs.path());
             if (!m.matches()) {
                 respond(ctx, HttpResponseStatus.NOT_FOUND, "not found");
@@ -256,6 +321,32 @@ public class MediaServer {
             } else {
                 hub.subscribe(k, this);
             }
+        }
+
+        /**
+         * 对讲：校验令牌后升级成 WebSocket，后面交给 {@link TalkSession}
+         */
+        private void talk(ChannelHandlerContext ctx, FullHttpRequest req, QueryStringDecoder qs, String k) {
+            List<String> token = qs.parameters().get("token");
+            if (!hub.authorizer().allowPlay(k, token == null || token.isEmpty() ? "" : token.get(0))) {
+                respond(ctx, HttpResponseStatus.FORBIDDEN, "forbidden");
+                return;
+            }
+            String url = "ws://" + req.headers().get(HttpHeaderNames.HOST, "localhost") + req.uri();
+            WebSocketServerHandshaker hs = new WebSocketServerHandshakerFactory(url, null, true, 64 * 1024).newHandshaker(req);
+            if (hs == null) {
+                WebSocketServerHandshakerFactory.sendUnsupportedVersionResponse(ctx.channel());
+                return;
+            }
+            TalkSession session = new TalkSession(k, hub, MediaServer.this);
+            ctx.pipeline().replace(this, "talk", session);
+            hs.handshake(ctx.channel(), req).addListener(f -> {
+                if (f.isSuccess()) {
+                    session.start(ctx.channel());
+                } else {
+                    ctx.close();
+                }
+            });
         }
 
         private void respond(ChannelHandlerContext ctx, HttpResponseStatus status, String text) {
