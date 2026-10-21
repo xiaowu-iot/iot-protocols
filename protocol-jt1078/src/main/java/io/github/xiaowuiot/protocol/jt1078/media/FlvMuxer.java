@@ -21,6 +21,12 @@ public final class FlvMuxer {
     public static final int CODEC_AVC = 7;
     public static final int CODEC_HEVC = 12;
 
+    /** 音频 tag 的第一个字节：编码(4) 采样率(2) 位宽(1) 声道(1)。AAC 固定写 44kHz、16 位、立体声（解码器以 AudioSpecificConfig 为准） */
+    public static final int AUDIO_AAC = 0xAF;
+    /** G.711 A 律 / μ 律：编码 7 / 8，16 位，单声道（采样率按标准固定 8000，这里的采样率位不起作用） */
+    public static final int AUDIO_G711A = 0x72;
+    public static final int AUDIO_G711U = 0x82;
+
     private FlvMuxer() {
     }
 
@@ -133,6 +139,24 @@ public final class FlvMuxer {
             b.writeInt(n.length);
             b.writeBytes(n);
         }
+        b.writeInt(11 + len);
+        return b;
+    }
+
+    /**
+     * 一帧音频
+     *
+     * @param aacPacketType AAC 才有：0 序列头（AudioSpecificConfig），1 裸帧；其他编码传 -1
+     */
+    public static ByteBuf audioTag(ByteBufAllocator alloc, int flags, int aacPacketType, byte[] data, int timestamp) {
+        int len = 1 + (aacPacketType >= 0 ? 1 : 0) + data.length;
+        ByteBuf b = alloc.buffer(11 + len + 4);
+        tagHeader(b, 8, len, timestamp);
+        b.writeByte(flags);
+        if (aacPacketType >= 0) {
+            b.writeByte(aacPacketType);
+        }
+        b.writeBytes(data);
         b.writeInt(11 + len);
         return b;
     }

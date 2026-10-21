@@ -127,6 +127,45 @@ public final class AudioCodec {
         return out;
     }
 
+    /**
+     * 16 位小端 PCM（{@link #toPcm} 的输出）编成 G.711A：RTMP 转推时 ADPCM 转成 G.711，对端（ZLMediaKit 等）才认
+     */
+    public static byte[] pcmToAlaw(byte[] pcmLe) {
+        byte[] out = new byte[pcmLe.length / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = alaw((short) ((pcmLe[2 * i] & 0xFF) | (pcmLe[2 * i + 1] << 8)));
+        }
+        return out;
+    }
+
+    /**
+     * 一段 ADTS 数据拆成帧：每帧返回 [AudioSpecificConfig（2 字节）, 去掉 ADTS 头的裸帧]。
+     * 一个 1078 音频包里可能连着几帧 AAC
+     */
+    public static java.util.List<byte[][]> adtsFrames(byte[] d) {
+        java.util.List<byte[][]> list = new java.util.ArrayList<>();
+        int i = 0;
+        while (i + 7 <= d.length) {
+            if ((d[i] & 0xFF) != 0xFF || (d[i + 1] & 0xF0) != 0xF0) {
+                break;
+            }
+            boolean noCrc = (d[i + 1] & 1) == 1;
+            int profile = (d[i + 2] >> 6) & 3;
+            int sfi = (d[i + 2] >> 2) & 0x0F;
+            int ch = ((d[i + 2] & 1) << 2) | ((d[i + 3] >> 6) & 3);
+            int frameLen = ((d[i + 3] & 3) << 11) | ((d[i + 4] & 0xFF) << 3) | ((d[i + 5] & 0xFF) >> 5);
+            int header = noCrc ? 7 : 9;
+            if (frameLen <= header || i + frameLen > d.length) {
+                break;
+            }
+            int obj = profile + 1;
+            byte[] asc = {(byte) ((obj << 3) | (sfi >> 1)), (byte) (((sfi & 1) << 7) | (ch << 3))};
+            list.add(new byte[][]{asc, java.util.Arrays.copyOfRange(d, i + header, i + frameLen)});
+            i += frameLen;
+        }
+        return list;
+    }
+
     /** 测试和模拟器用：16 位 PCM 编成 G.711A */
     public static byte[] pcmToAlaw(short[] pcm) {
         byte[] out = new byte[pcm.length];

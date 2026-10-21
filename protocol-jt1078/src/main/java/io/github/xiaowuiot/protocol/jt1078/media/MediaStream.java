@@ -43,6 +43,7 @@ public class MediaStream {
     private int lastTagTimestamp;
     private long maxPts;
     private int reorderDelay;
+    private int lastAudioTs;
     private static final int MAX_REORDER_MS = 1000;
     public static final int AUDIO_PCM = 1;
     public static final int AUDIO_AAC = 2;
@@ -71,6 +72,20 @@ public class MediaStream {
         void close();
 
         String id();
+
+        /**
+         * 旁听：不算观看人数（比如 RTMP 转推），平台里没人看了照样按时关流
+         */
+        default boolean passive() {
+            return false;
+        }
+
+        /**
+         * 要不要 FLV 音频 tag（RTMP 转推要；浏览器的声音走单独的 .audio，不要）
+         */
+        default boolean flvAudio() {
+            return false;
+        }
     }
 
     private static final class Sub {
@@ -78,6 +93,8 @@ public class MediaStream {
         boolean waitingKey;
         /** 序列头没写进去：下一个关键帧之前要先补发序列头 */
         boolean needHeader;
+        /** AAC 的音频序列头（AudioSpecificConfig）已经发过 */
+        byte[] aacConfigSent;
 
         Sub(Subscriber s) {
             this.s = s;
@@ -122,8 +139,17 @@ public class MediaStream {
         subs.removeIf(x -> x.s == s);
     }
 
+    /**
+     * 观看人数，不含旁听的（RTMP 转推）
+     */
     public int subscriberCount() {
-        return subs.size();
+        int n = 0;
+        for (Sub s : subs) {
+            if (!s.s.passive()) {
+                n++;
+            }
+        }
+        return n;
     }
 
     /**
@@ -232,6 +258,7 @@ public class MediaStream {
      */
     private void onAudio(FrameAssembler.Frame f) {
         audioPayload = Jt1078Packet.payloadName(f.payloadType);
+        flvAudio(f);
         if (audioSubs.isEmpty()) {
             return;
         }
@@ -259,6 +286,74 @@ public class MediaStream {
         chunk.release();
     }
 
+    /**
+     * 给要 FLV 音频的观看者（RTMP 转推）发音频 tag：G.711 原样（FLV 编码 7 / 8），ADPCM 先解码再转成 G.711A，
+     * AAC 去掉 ADTS 头，先发 AudioSpecificConfig 再发裸帧。时间戳和视频用同一个起点
+     */
+    private void flvAudio(FrameAssembler.Frame f) {
+        boolean any = false;
+        for (Sub s : subs) {
+            if (s.s.flvAudio() && !s.waitingKey) {
+                any = true;
+                break;
+            }
+        }
+        if (!any || baseTimestamp < 0) {
+            return;
+        }
+        long rel = f.timestamp - baseTimestamp;
+        if (rel < 0 || Math.abs(rel - lastTagTimestamp) > 10_000) {
+            // 音频时间戳和视频对不上（有的终端音视频时钟不同源）：贴着视频的时间走
+            rel = lastTagTimestamp;
+        }
+        int ts = (int) Math.max(lastAudioTs, rel);
+        lastAudioTs = ts;
+        byte[] raw = AudioCodec.stripHisiHeader(f.data);
+        if (f.payloadType == Jt1078Packet.PT_AAC) {
+            for (byte[][] fr : AudioCodec.adtsFrames(raw)) {
+                ByteBuf tag = FlvMuxer.audioTag(alloc, FlvMuxer.AUDIO_AAC, 1, fr[1], ts);
+                for (Sub s : subs) {
+                    if (!s.s.flvAudio() || s.waitingKey) {
+                        continue;
+                    }
+                    if (!Arrays.equals(s.aacConfigSent, fr[0])) {
+                        if (!s.s.write(FlvMuxer.audioTag(alloc, FlvMuxer.AUDIO_AAC, 0, fr[0], ts))) {
+                            continue;
+                        }
+                        s.aacConfigSent = fr[0];
+                    }
+                    s.s.write(tag.retainedDuplicate());
+                }
+                tag.release();
+            }
+            return;
+        }
+        int flags;
+        byte[] data;
+        if (f.payloadType == Jt1078Packet.PT_G711A) {
+            flags = FlvMuxer.AUDIO_G711A;
+            data = raw;
+        } else if (f.payloadType == Jt1078Packet.PT_G711U) {
+            flags = FlvMuxer.AUDIO_G711U;
+            data = raw;
+        } else if (f.payloadType == Jt1078Packet.PT_ADPCMA) {
+            flags = FlvMuxer.AUDIO_G711A;
+            data = AudioCodec.pcmToAlaw(AudioCodec.toPcm(f.payloadType, f.data));
+        } else {
+            return;
+        }
+        if (data.length == 0) {
+            return;
+        }
+        ByteBuf tag = FlvMuxer.audioTag(alloc, flags, -1, data, ts);
+        for (Sub s : subs) {
+            if (s.s.flvAudio() && !s.waitingKey) {
+                s.s.write(tag.retainedDuplicate());
+            }
+        }
+        tag.release();
+    }
+
     public synchronized void addAudioSubscriber(Subscriber s) {
         if (closed) {
             s.close();
@@ -284,6 +379,14 @@ public class MediaStream {
 
     public synchronized void close() {
         closed = true;
+        closeListeners.forEach(r -> {
+            try {
+                r.run();
+            } catch (RuntimeException e) {
+                // 回调出错不能影响关流
+            }
+        });
+        closeListeners.clear();
         for (Sub sub : subs) {
             sub.s.close();
         }
@@ -295,6 +398,21 @@ public class MediaStream {
             sequenceHeader.release();
             sequenceHeader = null;
         }
+    }
+
+    private final List<Runnable> closeListeners = new CopyOnWriteArrayList<>();
+
+    /**
+     * 流关闭时回调（RTMP 转推还没连上、没加入观看者列表时，也要知道流关了）。已经关了的流立即回调
+     */
+    public void onClose(Runnable r) {
+        synchronized (this) {
+            if (!closed) {
+                closeListeners.add(r);
+                return;
+            }
+        }
+        r.run();
     }
 
     public String getKey() {

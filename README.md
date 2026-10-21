@@ -6,7 +6,7 @@
 |---|---|---|
 | `protocol-core` | — | 底座：转义帧 / 长度帧 / ASCII 帧切帧，半包、粘包、垃圾数据处理，会话管理，指令应答匹配，TCP 服务，收发统计和原始报文记录；**与协议无关的报文解析器接口** |
 | `protocol-jt808` | JT/T 808-2011 / 2013 / 2019 | 消息头、分包合包、全部标准消息的编解码，位置附加信息，终端接入服务 |
-| `protocol-jt1078` | JT/T 1078-2016 | 音视频信令；码流解包（SIM 卡号 6 / 10 字节自动识别）、帧重组、HTTP-FLV 转封装 |
+| `protocol-jt1078` | JT/T 1078-2016 | 音视频信令；码流解包（SIM 卡号 6 / 10 字节自动识别）、帧重组、HTTP-FLV 转封装、声音分发、RTMP 转推 |
 | `protocol-hj212` | HJ 212-2005 / 2017 / 2025 | 实时和历史数据、反控命令、CRC；2025 版 Flag 识别、SM4 解密、心跳 |
 | `protocol-slp` | SLP（示例） | 一个虚构的智能储物柜私有协议，演示怎样从零设计私有二进制协议，见 [PROTOCOL.md](protocol-slp/PROTOCOL.md) |
 
@@ -214,10 +214,12 @@ flowchart TB
         FA --> MS["MediaStream<br/>拆 NAL、序列头、封装 FLV、GOP 缓存、分发"]
         MS --> HTTP["HttpFlvHandler（7617）<br/>校验播放令牌，chunked 输出 FLV"]
         IH -.->|"publish / unpublish"| HUB["StreamHub<br/>谁在推、谁在看、引用计数<br/>宽限期 30 秒、等推流 20 秒"]
+        HUB -.->|"开始推流（可选）"| RTMP["RtmpPublisher<br/>旁听观看者，不算人数"]
         HTTP -.->|"subscribe / unsubscribe"| HUB
     end
 
     HTTP -->|"⑤ HTTP-FLV"| PL["浏览器 mpegts.js 播放"]
+    RTMP -->|"RTMP（可选）"| ZLM["ZLMediaKit / SRS / CDN<br/>再转 HLS、WebRTC、RTSP"]
     HUB -.-> IDLE["⑥ 没人看了（宽限期到）或等不到推流：<br/>StreamHub.onIdle → VideoService 通过 808 下发 0x9102 / 0x9202 关闭"]
 ```
 
@@ -315,6 +317,45 @@ flowchart TD
 - 回放下发 0x9201（推到回放端口 7616），流标识后面加 `_pb`，和同一通道的实时视频分开。
 - 每次点回放都重新下发 0x9201；同一个 `_pb` 有新的推流连接时，旧的被踢掉。
 - 终端放完这段录像会断开推流连接，平台随即结束这路流；没人看时下发 0x9202 停止回放。
+
+#### 3.6 RTMP 转推（可选）
+
+需要 HLS、WebRTC、RTSP，或者观众很多要走 CDN 时，不自己实现这些协议，把流用 RTMP 推给 ZLMediaKit、SRS 或 CDN，由它们分发。RTMP 客户端是自己写的（Netty，不引入新依赖）：
+
+```java
+RtmpRelay relay = RtmpRelay.template("rtmp://127.0.0.1:1935/live/{key}?secret=xxx");
+hub.addPublishHook(relay::attach);   // 终端开始推流时自动转推，流关闭时跟着停
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant HUB as StreamHub
+    participant P as RtmpPublisher
+    participant S as ZLMediaKit / SRS
+    participant MS as MediaStream
+
+    HUB->>P: 终端开始推流（publish hook）
+    P->>S: TCP 连接，简单握手 C0 C1 → S0 S1 S2 → C2
+    P->>S: Set Chunk Size 4096，connect（app、tcUrl）
+    S-->>P: _result
+    P->>S: releaseStream、FCPublish、createStream
+    S-->>P: _result（消息流 ID）
+    P->>S: publish（流名带鉴权参数）
+    S-->>P: onStatus NetStream.Publish.Start
+    P->>MS: 以"旁听"身份加入（不算观看人数）
+    MS-->>P: 序列头 + 整组画面（GOP），对端马上能出图
+    loop 每一帧
+        MS-->>P: FLV tag
+        P->>S: 视频（类型 9）/ 音频（类型 8），数据就是 FLV tag 的数据部分
+    end
+    Note over P,S: 对端断开：2、4、8……最长 30 秒重连，重连后重新从关键帧开始
+    MS-->>P: 流关闭（没人看、终端停推）→ 断开，不再重连
+```
+
+- 声音：G.711 原样发（FLV 编码 7 / 8，ZLMediaKit 支持），ADPCM 先解码再转成 G.711A，AAC 去掉 ADTS 头、先发 AudioSpecificConfig
+- 转推跟着平台的按需拉流走：平台里有人看、终端在推才会转推；转推本身不让流一直开着
+- 对端收得慢时丢帧到下一个关键帧，不影响平台自己的观看者
 
 ### 4. HJ 212 污染物在线监测
 

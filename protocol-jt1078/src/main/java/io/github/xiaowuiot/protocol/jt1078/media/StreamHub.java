@@ -6,12 +6,15 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * 所有流的登记处：谁在推、谁在看，什么时候该让终端停止推流。
@@ -92,6 +95,7 @@ public class StreamHub {
     private volatile Listener listener = key -> {
     };
     private volatile Authorizer authorizer = DENY_ALL;
+    private final List<Consumer<MediaStream>> publishHooks = new CopyOnWriteArrayList<>();
 
     /**
      * @param graceSeconds 最后一个观看者离开后多久关流
@@ -105,6 +109,14 @@ public class StreamHub {
 
     public void setListener(Listener listener) {
         this.listener = listener;
+    }
+
+    /**
+     * 终端开始推流（含断线重连后重新推）时回调，比如 RTMP 转推。和 {@link Listener} 分开：
+     * Listener 归平台用，这个归媒体节点自己用，集群部署时媒体节点单独跑也能用
+     */
+    public void addPublishHook(Consumer<MediaStream> hook) {
+        publishHooks.add(hook);
     }
 
     public void setAuthorizer(Authorizer authorizer) {
@@ -134,6 +146,9 @@ public class StreamHub {
         waitingSince.remove(key);
         log.info("开始推流 {}", key);
         safely(() -> listener.onPublish(key), key);
+        for (Consumer<MediaStream> hook : publishHooks) {
+            safely(() -> hook.accept(s), key);
+        }
         if (s.subscriberCount() == 0) {
             // 有可能观看者已经走了（终端连上来很慢），也按没人看处理
             scheduleIdle(key);
