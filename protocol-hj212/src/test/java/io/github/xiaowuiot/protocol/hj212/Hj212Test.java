@@ -119,6 +119,21 @@ class Hj212Test {
     }
 
     @Test
+    void mnSwitchOnSameConnectionDropped() {
+        SessionManager sessions = new SessionManager();
+        List<Hj212Packet> received = new ArrayList<>();
+        EmbeddedChannel ch = serverChannel(sessions, (mn, pw) -> true, (s, p) -> {
+            received.add(p);
+            return CompletableFuture.completedFuture(null);
+        });
+        ch.writeInbound(ascii(Hj212Format.frame(REALTIME_DATA)));
+        ch.writeInbound(ascii(Hj212Format.frame(REALTIME_DATA.replace("88888880000001", "88888880000002"))));
+        assertEquals(1, received.size());
+        assertNotNull(sessions.get("88888880000001"));
+        assertNull(sessions.get("88888880000002"));
+    }
+
+    @Test
     void wrongPasswordDropped() {
         SessionManager sessions = new SessionManager();
         EmbeddedChannel ch = serverChannel(sessions, (mn, pw) -> "000000".equals(pw),

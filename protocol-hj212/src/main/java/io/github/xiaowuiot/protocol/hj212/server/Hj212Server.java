@@ -44,6 +44,7 @@ public class Hj212Server {
         this.sessions = b.sessions != null ? b.sessions : new SessionManager();
         this.commandSender = new Hj212CommandSender(sessions);
         Handler handler = new Handler(sessions, b.passwordChecker, b.listener, commandSender, b.autoTimeSync);
+        handler.setLockIdentity(b.lockIdentity);
         this.server = new TcpServer("212 接入服务", PROTOCOL, b.port, b.idleSeconds, b.workerThreads,
                 pipeline -> {
                     Hj212Codecs.addTo(pipeline, b.keys);
@@ -101,6 +102,8 @@ public class Hj212Server {
         private final Hj212Split.Assembler assembler = new Hj212Split.Assembler(60_000);
         private final boolean autoTimeSync;
         private static final io.netty.util.AttributeKey<String> PW_FAILED = io.netty.util.AttributeKey.valueOf("hj212.pwFailed");
+        private static final RateLimitedLog SWITCH_LOG = new RateLimitedLog(log, 5000);
+        private volatile boolean lockIdentity = true;
 
         public Handler(SessionManager sessions, BiPredicate<String, String> passwordChecker, Listener listener) {
             this(sessions, passwordChecker, listener, new Hj212CommandSender(sessions), false);
@@ -126,8 +129,14 @@ public class Hj212Server {
                 return;
             }
             Session session = SessionManager.get(ctx.channel());
+            if (lockIdentity && session != null && !session.getDeviceId().equals(received.getMn())) {
+                // 一条连接只认第一个通过校验的 MN：防止已经连上的设备冒用别的 MN 上报数据（顶掉真设备的会话、写进别人的数据）。
+                // 数采仪改了 MN 会重新连接，正常不会在同一条连接上换
+                SWITCH_LOG.warn("同一条连接上 MN 变了，丢弃", ctx.channel() + " " + session.getDeviceId() + " -> " + received.getMn(), null);
+                return;
+            }
             if (session == null || !session.getDeviceId().equals(received.getMn())) {
-                // 第一条合法数据到达时上线。一条连接上的 MN 变了（数采仪换了配置），旧设备下线，按新设备处理
+                // 第一条合法数据到达时上线。没有锁定身份时 MN 变了：旧设备下线，按新设备处理
                 if (session != null) {
                     sessions.unregister(ctx.channel());
                 }
@@ -216,6 +225,14 @@ public class Hj212Server {
                     .whenComplete((r, e) -> log.info("{} 校时结果：{}", p.getMn(), e == null ? r : e.toString()));
         }
 
+        /**
+         * 同一条连接上 MN 变了怎么办：true（默认）丢弃新 MN 的数据；false 旧设备下线、按新设备处理
+         * （个别数采仪一条连接上报多个监测点、每个监测点一个 MN，才需要关掉）
+         */
+        public void setLockIdentity(boolean lockIdentity) {
+            this.lockIdentity = lockIdentity;
+        }
+
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
             sessions.connected(PROTOCOL, ctx.channel());
@@ -260,6 +277,7 @@ public class Hj212Server {
         private Listener listener = Listener.NOOP;
         private boolean autoTimeSync = true;
         private Hj212Codecs.KeyLookup keys;
+        private boolean lockIdentity = true;
 
         public Builder port(int port) {
             this.port = port;
@@ -307,6 +325,14 @@ public class Hj212Server {
          */
         public Builder keys(Hj212Codecs.KeyLookup keys) {
             this.keys = keys;
+            return this;
+        }
+
+        /**
+         * 一条连接只认第一个 MN（默认开启），见 {@link Handler#setLockIdentity}
+         */
+        public Builder lockIdentity(boolean on) {
+            this.lockIdentity = on;
             return this;
         }
 
